@@ -178,6 +178,51 @@ test('runPreflightCheck: fails OPEN (ok=true) on a 401 Invalid API Key rather th
   assert.equal(result.status, 401);
 });
 
+// --- Body-level hard gate (allowExecution: false), independent of the
+// HTTP status code ------------------------------------------------------
+// A 2xx response is NOT sufficient to proceed: shorky-cloud's governance
+// contract communicates the actual allow/deny decision via the JSON
+// body's `allowExecution` field. The CLI must treat `allowExecution: false`
+// as a hard stop exactly like a 429, even when the HTTP status is 200.
+
+test('runPreflightCheck: returns ok=false and the correct message on HTTP 200 with allowExecution: false (Pro budget exhausted)', async () => {
+  mock.method(globalThis, 'fetch', async () =>
+    jsonResponse(200, {
+      success: false,
+      tier: 'pro',
+      allowExecution: false,
+      message: 'Budget guardrail reached (1000000/1000000 tokens used this billing period).',
+      tokensUsed: 1_000_000,
+      monthlyTokenLimit: 1_000_000,
+    }),
+  );
+
+  const result = await runPreflightCheck();
+
+  assert.equal(result.ok, false);
+  assert.equal(result.skipped, false);
+  assert.equal(result.status, 200);
+  assert.equal(result.message, 'Monthly token budget exceeded. Healing aborted.');
+});
+
+test('runPreflightCheck: returns ok=true on HTTP 200 with allowExecution: true (Free tier — never blocked)', async () => {
+  mock.method(globalThis, 'fetch', async () =>
+    jsonResponse(200, {
+      success: true,
+      tier: 'free',
+      allowExecution: true,
+      tokensUsed: 0,
+      monthlyTokenLimit: 1_000_000,
+    }),
+  );
+
+  const result = await runPreflightCheck();
+
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, false);
+  assert.equal(result.status, 200);
+});
+
 // --- Skip-path scenarios -----------------------------------------------
 
 test('runPreflightCheck: skips entirely (ok=true, skipped=true) and never calls fetch when no API key is configured', async () => {
