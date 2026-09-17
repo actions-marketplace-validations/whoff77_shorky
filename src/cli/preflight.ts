@@ -43,9 +43,19 @@ export interface PreflightResult {
  *    inactive (402) or the monthly token budget has been exceeded (429).
  *    Callers MUST treat this as a hard stop: abort before starting the LLM
  *    repair loop and fail the CI job normally.
+ *  - HARD GATE ON THE RESPONSE BODY, independent of HTTP status: even when
+ *    shorky-cloud responds with a 2xx (e.g. the always-200
+ *    `/api/v1/governance/preflight` contract, or any future change to this
+ *    legacy route), a JSON body containing `allowExecution: false` is
+ *    treated exactly like a 429 — a hard stop with `ok: false`. This CLI
+ *    intentionally does NOT re-implement any tier-checking logic itself
+ *    (free vs. pro, budget math, etc.) — that decision is made entirely by
+ *    shorky-cloud; the CLI's only job is to honor whatever
+ *    `allowExecution` value it's given.
  *  - Fails OPEN (`{ ok: true }`) on network errors/timeouts/unexpected
- *    non-402/429 error responses, so a transient shorky-cloud outage never
- *    blocks a customer's CI pipeline — consistent with how
+ *    non-402/429 error responses (and any 2xx body that omits
+ *    `allowExecution` or sets it `true`), so a transient shorky-cloud
+ *    outage never blocks a customer's CI pipeline — consistent with how
  *    `cloudReporter.ts` and `fixTrace.ts`'s webhook dispatch already treat
  *    connectivity failures as non-fatal.
  */
@@ -92,6 +102,22 @@ export async function runPreflightCheck(): Promise<PreflightResult> {
         `⚠️ [Shorky] Pre-flight check returned unexpected status ${response.status}: ${data?.error || 'Unknown error'}. Continuing without blocking.`,
       );
       return { ok: true, skipped: false, status: response.status };
+    }
+
+    // HARD GATE: a 2xx HTTP status alone does NOT mean the LLM repair loop
+    // may proceed. shorky-cloud's governance contract communicates the
+    // actual allow/deny decision via `allowExecution` in the JSON body
+    // (always-200 on `/api/v1/governance/preflight`, and this legacy
+    // `/api/v1/preflight` route now echoes the same field). This CLI must
+    // treat `allowExecution === false` as a hard stop exactly like a 429,
+    // WITHOUT re-implementing any tier-checking logic itself — the
+    // free/pro/budget decision is made entirely server-side; the CLI only
+    // has to honor whatever value it's handed back.
+    const data = await response.json().catch(() => ({}));
+    if (data?.allowExecution === false) {
+      const message = 'Monthly token budget exceeded. Healing aborted.';
+      console.error(`❌ [Shorky] ${message}`);
+      return { ok: false, skipped: false, status: response.status, message };
     }
 
     console.log('✅ [Shorky] Pre-flight budget check passed.');
