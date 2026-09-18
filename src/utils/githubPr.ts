@@ -34,6 +34,15 @@ export interface HealedFixEntry {
   fixedCode?: string;
   /** Absolute path to the trace.zip analyzed for this fix, for webhook telemetry. */
   traceZipPath?: string;
+  /**
+   * LLM tokens consumed generating this fix (`FixResult.tokensUsed`, from
+   * `codeFixer.ts`'s `response.usage.total_tokens`), 0/undefined when
+   * unavailable (e.g. visual-regression handoff entries, which never call
+   * the LLM). Carried through to the shorky-cloud webhook payload so
+   * `/api/webhook` can atomically increment `projects.tokensUsedThisMonth`
+   * for BYOK self-healing runs — see `notifyShorkyCloud()` in fixTrace.ts.
+   */
+  tokensUsed?: number;
 }
 
 /** @deprecated kept as an alias for HealedFixEntry for backward compatibility. */

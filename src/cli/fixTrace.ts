@@ -43,7 +43,8 @@ async function notifyShorkyCloud(
   fixResult: { fixedCode: string; explanation: string }, 
   traceZipPath?: string | null,
   errorLog?: string | null,
-  runId?: string
+  runId?: string,
+  tokensUsed?: number
 ) {
   const [repoOwner, repoName] = (process.env.GITHUB_REPOSITORY || 'owner/repo').split('/');
   const sanitizedSpecPath = specPath.replace(/^\/+/, '');
@@ -57,6 +58,14 @@ async function notifyShorkyCloud(
     fixedCode: fixResult.fixedCode,
     explanation: fixResult.explanation,
     runId: runId || undefined,
+    // LLM tokens consumed generating this fix (see codeFixer.ts's
+    // response.usage.total_tokens, threaded through HealedFixEntry.tokensUsed).
+    // shorky-cloud's /api/webhook uses this to atomically increment
+    // projects.tokensUsedThisMonth for BYOK self-healing runs -- without it,
+    // the free-tier budget guard never reflects standalone/webhook-driven
+    // healing spend (only the separate cloudReporter.ts /api/v1/telemetry
+    // path was previously wired up to do this).
+    tokensUsed: tokensUsed || 0,
   };
 
   // [DIAGNOSTIC] Print the exact outgoing webhook payload (minus the API
@@ -143,7 +152,8 @@ async function notifyShorkyCloudBatch(
       { fixedCode: fix.fixedCode as string, explanation: fix.explanation },
       fix.traceZipPath,
       fix.errorLog,
-      runId
+      runId,
+      fix.tokensUsed
     );
   }
 }
@@ -673,6 +683,11 @@ export async function runOfflineFix({
     errorLog: failureContext.errorMessage,
     fixedCode: overwriteResult.cleanedCode,
     traceZipPath: absoluteTracePath,
+    // Extracted from generateSpecFix()'s FixResult (response.usage.total_tokens
+    // in codeFixer.ts) -- carried through so the webhook dispatch below
+    // (standalone path) / notifyShorkyCloudBatch (batch path) can report it
+    // to shorky-cloud's /api/webhook for the tokensUsedThisMonth budget guard.
+    tokensUsed: fixResult.tokensUsed,
   };
 
   if (batchMode) {
@@ -712,7 +727,8 @@ export async function runOfflineFix({
       { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation },
       absoluteTracePath,
       failureContext.errorMessage,
-      effectiveRunId
+      effectiveRunId,
+      fixResult.tokensUsed
     );
   }
 
