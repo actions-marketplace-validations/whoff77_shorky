@@ -40,7 +40,7 @@ function assertIndividualPrAllowed(specPath, batchMode) {
  * see `notifyShorkyCloudBatch` — so a single report with N failed specs
  * only ever produces one webhook call, not N.
  */
-async function notifyShorkyCloud(specPath, fixResult, traceZipPath, errorLog, runId) {
+async function notifyShorkyCloud(specPath, fixResult, traceZipPath, errorLog, runId, tokensUsed) {
     const [repoOwner, repoName] = (process.env.GITHUB_REPOSITORY || 'owner/repo').split('/');
     const sanitizedSpecPath = specPath.replace(/^\/+/, '');
     const payload = {
@@ -53,6 +53,14 @@ async function notifyShorkyCloud(specPath, fixResult, traceZipPath, errorLog, ru
         fixedCode: fixResult.fixedCode,
         explanation: fixResult.explanation,
         runId: runId || undefined,
+        // LLM tokens consumed generating this fix (see codeFixer.ts's
+        // response.usage.total_tokens, threaded through HealedFixEntry.tokensUsed).
+        // shorky-cloud's /api/webhook uses this to atomically increment
+        // projects.tokensUsedThisMonth for BYOK self-healing runs -- without it,
+        // the free-tier budget guard never reflects standalone/webhook-driven
+        // healing spend (only the separate cloudReporter.ts /api/v1/telemetry
+        // path was previously wired up to do this).
+        tokensUsed: tokensUsed || 0,
     };
     // [DIAGNOSTIC] Print the exact outgoing webhook payload (minus the API
     // key, which is sent as a header, not in the body) right before the
@@ -119,7 +127,7 @@ async function notifyShorkyCloudBatch(fixes, runId) {
     }
     for (const fix of notifiable) {
         console.log(`➡️  [Diagnostic] Notifying shorky-cloud for "${fix.specPath}" using shared batch runId="${runId}" (consolidated path — no per-fix runId is generated here).`);
-        await notifyShorkyCloud(fix.specPath, { fixedCode: fix.fixedCode, explanation: fix.explanation }, fix.traceZipPath, fix.errorLog, runId);
+        await notifyShorkyCloud(fix.specPath, { fixedCode: fix.fixedCode, explanation: fix.explanation }, fix.traceZipPath, fix.errorLog, runId, fix.tokensUsed);
     }
 }
 /**
@@ -511,6 +519,11 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
         errorLog: failureContext.errorMessage,
         fixedCode: overwriteResult.cleanedCode,
         traceZipPath: absoluteTracePath,
+        // Extracted from generateSpecFix()'s FixResult (response.usage.total_tokens
+        // in codeFixer.ts) -- carried through so the webhook dispatch below
+        // (standalone path) / notifyShorkyCloudBatch (batch path) can report it
+        // to shorky-cloud's /api/webhook for the tokensUsedThisMonth budget guard.
+        tokensUsed: fixResult.tokensUsed,
     };
     if (batchMode) {
         // Batch report mode: only stage the fix onto the shared consolidated
@@ -543,7 +556,7 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
         // Dispatch the per-spec webhook only for the standalone (non-batch)
         // single-fix flow. Batch runs are notified once, in aggregate, from
         // `runReportFix` after the consolidated PR is opened.
-        await notifyShorkyCloud(specPath, { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation }, absoluteTracePath, failureContext.errorMessage, effectiveRunId);
+        await notifyShorkyCloud(specPath, { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation }, absoluteTracePath, failureContext.errorMessage, effectiveRunId, fixResult.tokensUsed);
     }
     return healedFix;
 }
