@@ -3,7 +3,7 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { parsePlaywrightTrace, resolveSpecSourcePath, isVisualRegressionFailure } from '../engine/traceParser';
 import { generateSpecFix, FixResult } from '../engine/codeFixer';
-import { getShorkyCloudApiKey, getShorkyCloudWebhookUrl } from '../config/shorkyCloud';
+import { getShorkyCloudApiKey, getShorkyCloudWebhookUrl, logDashboardCallToAction } from '../config/shorkyCloud';
 import { runPreflightCheck } from './preflight';
 import { HealedFixEntry, openHealingPullRequest, pushConsolidatedHealingBranch, stageHealingFix } from '../utils/githubPr';
 import { overwriteSpecInPlace } from '../agent/generator';
@@ -156,6 +156,11 @@ async function notifyShorkyCloudBatch(
       fix.tokensUsed
     );
   }
+
+  // Single summary CTA for the whole batch, printed once after every fix in
+  // this run has been dispatched (rather than per-fix, which would spam the
+  // log with the same line N times for an N-fix batch).
+  logDashboardCallToAction();
 }
 
 // --- Playwright JSON Report Parsing (--report support) ---
@@ -730,6 +735,7 @@ export async function runOfflineFix({
       effectiveRunId,
       fixResult.tokensUsed
     );
+    logDashboardCallToAction();
   }
 
   return healedFix;

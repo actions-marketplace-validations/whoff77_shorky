@@ -1,7 +1,7 @@
 import { Reporter, FullConfig, Suite, TestCase, TestResult, FullResult } from '@playwright/test/reporter';
 import fs from 'fs';
 import path from 'path';
-import { getShorkyCloudApiKey, getShorkyCloudTelemetryUrl, isShorkyCloudEnabled } from '../config/shorkyCloud';
+import { getShorkyCloudApiKey, getShorkyCloudTelemetryUrl, isShorkyCloudEnabled, logDashboardCallToAction } from '../config/shorkyCloud';
 import { SHORKY_TOKENS_ATTACHMENT_NAME } from '../fixtures/autoHealFixture';
 
 interface TestRunItem {
@@ -49,6 +49,7 @@ export default class ShorkyCloudReporter implements Reporter {
   onBegin(config: FullConfig, suite: Suite) {
     if (!this.apiKey) {
       console.log('ℹ️ [Shorky] SHORKY_CLOUD_API_KEY not found. Skipping cloud reporting.');
+      logDashboardCallToAction();
       return;
     }
     console.log('🚀 [Shorky] Initializing Shorky Cloud reporting run...');
@@ -142,6 +143,7 @@ export default class ShorkyCloudReporter implements Reporter {
         console.error('⚠️ [Shorky Cloud] Backend responded with status:', response.status, JSON.stringify(errorData, null, 2));
       } else {
         console.log('✅ [Shorky Cloud] Telemetry successfully transmitted.');
+        logDashboardCallToAction();
       }
     } catch (error: any) {
       // Gracefully log offline status without throwing an unhandled stack trace

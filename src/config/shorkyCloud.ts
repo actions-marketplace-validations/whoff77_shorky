@@ -14,6 +14,23 @@ export const DEFAULT_SHORKY_CLOUD_TELEMETRY_URL = 'http://localhost:3000/api/v1/
 export const DEFAULT_SHORKY_CLOUD_BASE_URL = 'https://shorky-cloud.vercel.app';
 
 /**
+ * Logs a one-line CTA pointing the user at the shorky-cloud dashboard,
+ * shown once per successful telemetry dispatch (cloudReporter.ts) or fix
+ * webhook dispatch (fixTrace.ts). The message differs depending on whether
+ * a SHORKY_API_KEY/SHORKY_CLOUD_API_KEY was actually configured for this
+ * run, since an unauthenticated/anonymous run has no dashboard to view yet.
+ */
+export function logDashboardCallToAction(): void {
+  if (getShorkyCloudApiKey()) {
+    console.log(`📊 View telemetry & run history: ${DEFAULT_SHORKY_CLOUD_BASE_URL}/dashboard`);
+  } else {
+    console.log(
+      `💡 Track CI runs & monitor token usage: ${DEFAULT_SHORKY_CLOUD_BASE_URL} (sign in with GitHub to get your free API key)`,
+    );
+  }
+}
+
+/**
  * Sanitizes a raw SHORKY_CLOUD_URL environment value by trimming whitespace,
  * stripping stray leading/trailing quote characters, and removing any
  * accidental markdown link artifacts (e.g. a value copy-pasted as
