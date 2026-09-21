@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const shorkyCloud_1 = require("../config/shorkyCloud");
 const autoHealFixture_1 = require("../fixtures/autoHealFixture");
+const gitContext_1 = require("../utils/gitContext");
 /**
  * Extracts the LLM token count `autoHealFixture.ts` attached to this test
  * result (see `SHORKY_TOKENS_ATTACHMENT_NAME`), if any. Attachments cross
@@ -33,6 +34,7 @@ class ShorkyCloudReporter {
     onBegin(config, suite) {
         if (!this.apiKey) {
             console.log('ℹ️ [Shorky] SHORKY_CLOUD_API_KEY not found. Skipping cloud reporting.');
+            (0, shorkyCloud_1.logDashboardCallToAction)();
             return;
         }
         console.log('🚀 [Shorky] Initializing Shorky Cloud reporting run...');
@@ -77,9 +79,17 @@ class ShorkyCloudReporter {
             // total when present, atomically incrementing that project's
             // tokensUsedThisMonth for the /api/v1/preflight budget guard.
             const totalTokensUsed = this.testItems.reduce((sum, item) => sum + item.tokensUsed, 0);
+            // Standardized repo identity (GITHUB_REPOSITORY -> local .git/config
+            // -> "local/unknown") — see gitContext.ts. Split into repoOwner/repoName
+            // and sent in the exact same shape `fixTrace.ts`'s notifyShorkyCloud()
+            // sends, so the dashboard shows a consistent repo identity for both
+            // the run-level telemetry (this reporter) and the per-fix webhook.
+            const [repoOwner, repoName] = (0, gitContext_1.resolveRepositoryName)().split('/');
             // Construct the flattened payload matching shorky-cloud's Zod schema
             const telemetryPayload = {
                 projectName: process.env.SHORKY_PROJECT_NAME || 'shorky',
+                repoOwner,
+                repoName,
                 status: failedCount > 0 ? 'failed' : 'passed',
                 passedCount,
                 failedCount,
@@ -117,6 +127,7 @@ class ShorkyCloudReporter {
             }
             else {
                 console.log('✅ [Shorky Cloud] Telemetry successfully transmitted.');
+                (0, shorkyCloud_1.logDashboardCallToAction)();
             }
         }
         catch (error) {

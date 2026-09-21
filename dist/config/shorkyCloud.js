@@ -9,6 +9,7 @@
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.DEFAULT_SHORKY_CLOUD_BASE_URL = exports.DEFAULT_SHORKY_CLOUD_TELEMETRY_URL = void 0;
+exports.logDashboardCallToAction = logDashboardCallToAction;
 exports.sanitizeCloudUrl = sanitizeCloudUrl;
 exports.isShorkyCloudEnabled = isShorkyCloudEnabled;
 exports.getShorkyCloudApiKey = getShorkyCloudApiKey;
@@ -19,6 +20,21 @@ exports.getShorkyCloudPreflightUrl = getShorkyCloudPreflightUrl;
 exports.DEFAULT_SHORKY_CLOUD_TELEMETRY_URL = 'http://localhost:3000/api/v1/telemetry';
 /** Default base URL used for the hosted shorky-cloud webhook (CLI auto-fix flow). */
 exports.DEFAULT_SHORKY_CLOUD_BASE_URL = 'https://shorky-cloud.vercel.app';
+/**
+ * Prints a one-line call-to-action pointing at the shorky-cloud dashboard,
+ * shown once per successful telemetry dispatch (cloudReporter.ts) or fix
+ * webhook dispatch (fixTrace.ts). The message differs depending on whether
+ * a SHORKY_API_KEY/SHORKY_CLOUD_API_KEY was actually configured for this
+ * run, since an unauthenticated/anonymous run has no dashboard to view yet.
+ */
+function logDashboardCallToAction() {
+    if (getShorkyCloudApiKey()) {
+        console.log(`📊 View telemetry & run history: ${exports.DEFAULT_SHORKY_CLOUD_BASE_URL}/dashboard`);
+    }
+    else {
+        console.log(`💡 Track CI runs & monitor token usage: ${exports.DEFAULT_SHORKY_CLOUD_BASE_URL} (sign in with GitHub to get your free API key)`);
+    }
+}
 /**
  * Sanitizes a raw SHORKY_CLOUD_URL environment value by trimming whitespace,
  * stripping stray leading/trailing quote characters, and removing any
