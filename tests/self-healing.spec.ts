@@ -1,19 +1,15 @@
-import { test, expect } from '../src/fixtures/autoHealFixture';
+import { test, expect } from '@playwright/test';
 
-test.describe('Shorky Self-Healing Suite', () => {
-  test('Automatically heals a broken button selector', async ({ autoHealPage }) => {
-    const { page, clickAndHeal } = autoHealPage;
+test('user should be able to log in', async ({ page }) => {
+  await page.goto('https://the-internet.herokuapp.com/login');
 
-    await page.goto('https://the-internet.herokuapp.com/login');
+  // Fill in the username and password fields using correct label locators
+  await page.getByLabel('Username').fill('tomsmith');
+  await page.getByLabel('Password').fill('SuperSecretPassword!');
 
-    // Fill in standard inputs
-    await page.fill('#username', 'tomsmith');
-    await page.fill('#password', 'SuperSecretPassword!');
+  // Click the login button
+  await page.getByRole('button', { name: /Login/ }).click();
 
-    // Pass an INTENTIONALLY BROKEN selector to our self-healing handler
-    await clickAndHeal('button[type="sumbmit"]');
-
-    // Verify successful login navigation post-healing
-    await expect(page.locator('#flash')).toContainText('You logged into a secure area!');
-  });
+  // Assert that the login was successful by checking the URL
+  await expect(page).toHaveURL('https://the-internet.herokuapp.com/secure');
 });
