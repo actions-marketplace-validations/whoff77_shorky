@@ -1,21 +1,50 @@
 import fs from 'fs';
 import path from 'path';
-import { parsePlaywrightTrace } from '../engine/traceParser';
+import { randomUUID } from 'crypto';
+import { parsePlaywrightTrace, resolveSpecSourcePath, isVisualRegressionFailure } from '../engine/traceParser';
 import { generateSpecFix, FixResult } from '../engine/codeFixer';
-import { getShorkyCloudApiKey, getShorkyCloudWebhookUrl } from '../config/shorkyCloud';
+import { getShorkyCloudApiKey, getShorkyCloudWebhookUrl, logDashboardCallToAction } from '../config/shorkyCloud';
+import { runPreflightCheck } from './preflight';
+import { HealedFixEntry, openHealingPullRequest, pushConsolidatedHealingBranch, stageHealingFix } from '../utils/githubPr';
+import { overwriteSpecInPlace } from '../agent/generator';
 
 import dotenv from 'dotenv';
 dotenv.config();
 
 /**
- * Sends the final repaired code and trace context to shorky-cloud, 
+ * Hard runtime guard invoked immediately before every `openHealingPullRequest()`
+ * call site. Individual PR creation must NEVER happen while a batch report
+ * run is in progress — that's the exact root cause of duplicate individual
+ * PRs (e.g. #47, #48) appearing alongside the single consolidated PR.
+ * Throwing here (rather than merely logging) makes it structurally
+ * impossible for a future refactor to accidentally invoke
+ * `openHealingPullRequest()` from the batch path without an immediate,
+ * loud failure.
+ */
+function assertIndividualPrAllowed(specPath: string, batchMode: boolean): void {
+  if (batchMode) {
+    throw new Error(
+      `Invariant violation: attempted to call openHealingPullRequest() for "${specPath}" while batchMode=true. Individual PR creation is strictly forbidden during batch report runs — only the single consolidated pull request (via pushConsolidatedHealingBranch) may be created.`
+    );
+  }
+}
+
+/**
+ * Sends the final repaired code and trace context to shorky-cloud,
  * ensuring it only triggers once per successful offline fix.
+ *
+ * Only used for the standalone (`--trace`/`--spec`) single-fix flow. Batch
+ * report runs (`runReportFix`) intentionally skip this per-spec dispatch —
+ * see `notifyShorkyCloudBatch` — so a single report with N failed specs
+ * only ever produces one webhook call, not N.
  */
 async function notifyShorkyCloud(
   specPath: string, 
   fixResult: { fixedCode: string; explanation: string }, 
   traceZipPath?: string | null,
-  errorLog?: string | null
+  errorLog?: string | null,
+  runId?: string,
+  tokensUsed?: number
 ) {
   const [repoOwner, repoName] = (process.env.GITHUB_REPOSITORY || 'owner/repo').split('/');
   const sanitizedSpecPath = specPath.replace(/^\/+/, '');
@@ -28,7 +57,23 @@ async function notifyShorkyCloud(
     errorLog: errorLog || null,
     fixedCode: fixResult.fixedCode,
     explanation: fixResult.explanation,
+    runId: runId || undefined,
+    // LLM tokens consumed generating this fix (see codeFixer.ts's
+    // response.usage.total_tokens, threaded through HealedFixEntry.tokensUsed).
+    // shorky-cloud's /api/webhook uses this to atomically increment
+    // projects.tokensUsedThisMonth for BYOK self-healing runs -- without it,
+    // the free-tier budget guard never reflects standalone/webhook-driven
+    // healing spend (only the separate cloudReporter.ts /api/v1/telemetry
+    // path was previously wired up to do this).
+    tokensUsed: tokensUsed || 0,
   };
+
+  // [DIAGNOSTIC] Print the exact outgoing webhook payload (minus the API
+  // key, which is sent as a header, not in the body) right before the
+  // request is dispatched. This is the single source of truth for
+  // confirming which runId a given spec's telemetry was actually tagged
+  // with — critical for tracing down split/duplicate Neon run IDs.
+  console.log(`📤 [Diagnostic] shorky-cloud webhook payload for "${sanitizedSpecPath}":`, JSON.stringify(payload, null, 2));
 
   const webhookUrl = getShorkyCloudWebhookUrl(process.env.SHORKY_CLOUD_URL);
   try {
@@ -51,6 +96,71 @@ async function notifyShorkyCloud(
   } catch (err: any) {
     console.warn(`⚠️ Failed to trigger shorky-cloud webhook:`, err.message || err);
   }
+}
+
+/**
+ * Notifies shorky-cloud of every fix produced during a batch `runReportFix()`
+ * run, sharing the same suite-wide `runId` so every dispatch is grouped
+ * under a single run card on the dashboard.
+ *
+ * shorky-cloud's `/api/webhook` endpoint validates the request body against
+ * a *flat* Zod schema requiring non-empty top-level `specPath`, `fixedCode`,
+ * and `explanation` strings — it has no concept of a batched/nested
+ * `fixes: [...]` array. Sending one combined request with a nested array
+ * (and no top-level `specPath`/`fixedCode`/`explanation`) fails Zod
+ * validation with a 400 "Invalid payload" error on every batch run.
+ *
+ * To stay compatible with that schema while still avoiding a fresh/duplicate
+ * PR per spec, this dispatches one flat, schema-shaped webhook request per
+ * healed code fix — reusing the exact same payload shape as
+ * `notifyShorkyCloud()` — but all sharing `runId` so shorky-cloud attaches
+ * every trace to the same test run rather than creating N separate runs.
+ * Visual-regression handoff entries have no generated code (`fixedCode` is
+ * required/non-empty by the schema) and are intentionally skipped here;
+ * they're already fully represented in the consolidated PR body.
+ */
+async function notifyShorkyCloudBatch(
+  fixes: HealedFixEntry[],
+  runId: string
+) {
+  const notifiable = fixes.filter((fix) => !fix.isVisualRegression && !!fix.fixedCode && !!fix.specPath);
+
+  // [DIAGNOSTIC] Print the aggregated batch structure right before any
+  // network calls are made — this is the single choke point every batch
+  // notification passes through, so if Neon ever shows split run IDs again,
+  // this log immediately reveals whether the bug is upstream (multiple
+  // distinct runIds reaching this function) or downstream (this function
+  // failing to propagate the shared runId into individual dispatches).
+  console.log(
+    `📋 [Diagnostic] notifyShorkyCloudBatch: dispatching ${notifiable.length}/${fixes.length} fix(es) under shared runId="${runId}":`,
+    JSON.stringify(
+      notifiable.map((fix) => ({ specPath: fix.specPath, hasFixedCode: !!fix.fixedCode, isVisualRegression: !!fix.isVisualRegression })),
+      null,
+      2
+    )
+  );
+
+  if (notifiable.length === 0) {
+    console.log('ℹ️ No code-fix entries with fixedCode to report to shorky-cloud for this batch.');
+    return;
+  }
+
+  for (const fix of notifiable) {
+    console.log(`➡️  [Diagnostic] Notifying shorky-cloud for "${fix.specPath}" using shared batch runId="${runId}" (consolidated path — no per-fix runId is generated here).`);
+    await notifyShorkyCloud(
+      fix.specPath,
+      { fixedCode: fix.fixedCode as string, explanation: fix.explanation },
+      fix.traceZipPath,
+      fix.errorLog,
+      runId,
+      fix.tokensUsed
+    );
+  }
+
+  // Single summary CTA for the whole batch, printed once after every fix in
+  // this run has been dispatched (rather than per-fix, which would spam the
+  // log with the same line N times for an N-fix batch).
+  logDashboardCallToAction();
 }
 
 // --- Playwright JSON Report Parsing (--report support) ---
@@ -91,10 +201,42 @@ interface PlaywrightJsonReport {
   suites?: ReportSuite[];
 }
 
+/** Expected/actual/diff PNG paths Playwright generates for a failed visual snapshot comparison. */
+export interface VisualDiffArtifacts {
+  expectedPath?: string;
+  actualPath?: string;
+  diffPath?: string;
+}
+
 export interface FailedSpecInfo {
   specPath: string;
   traceZipPath?: string;
   errorLog?: string;
+  /** True when this failure is a visual regression (screenshot/pixel) mismatch, not a DOM/action failure. */
+  isVisualRegression?: boolean;
+  /** Populated only when isVisualRegression is true. */
+  visualDiff?: VisualDiffArtifacts;
+}
+
+/**
+ * Extracts the expected/actual/diff PNG attachment paths Playwright records
+ * for a failed `toHaveScreenshot`/`toMatchSnapshot` assertion. Playwright
+ * names these attachments `<snapshotName>-expected.png`,
+ * `<snapshotName>-actual.png`, and `<snapshotName>-diff.png` respectively.
+ */
+function extractVisualDiffArtifacts(attachments: ReportAttachment[] | undefined): VisualDiffArtifacts {
+  const artifacts: VisualDiffArtifacts = {};
+  for (const attachment of attachments || []) {
+    if (!attachment.path) continue;
+    if (/-expected\.png$/i.test(attachment.name)) {
+      artifacts.expectedPath = attachment.path;
+    } else if (/-actual\.png$/i.test(attachment.name)) {
+      artifacts.actualPath = attachment.path;
+    } else if (/-diff\.png$/i.test(attachment.name)) {
+      artifacts.diffPath = attachment.path;
+    }
+  }
+  return artifacts;
 }
 
 function collectFailedSpecsFromReport(report: PlaywrightJsonReport): FailedSpecInfo[] {
@@ -133,21 +275,11 @@ function collectFailedSpecsFromReport(report: PlaywrightJsonReport): FailedSpecI
           if (traceAttachment) break;
         }
 
-        // spec.file may already be relative (as emitted by the Playwright
-        // JSON reporter for most configs) or absolute (e.g. when the report
-        // is generated from a different working directory). Only apply
-        // path.relative() when we actually have an absolute path so we
-        // don't mangle an already-correct relative path.
-        let relativeSpecPath = '';
-        if (spec.file) {
-          relativeSpecPath = path.isAbsolute(spec.file)
-            ? path.relative(process.cwd(), spec.file)
-            : spec.file;
-        }
-        if (relativeSpecPath && !relativeSpecPath.startsWith('tests/') && !relativeSpecPath.startsWith('tests' + path.sep)) {
-          relativeSpecPath = path.join('tests', relativeSpecPath);
-        }
-        const resolvedSpecPath = relativeSpecPath || spec.file || 'unknown-spec';
+        // Map the raw report entry back to the exact original source test
+        // file path on disk (see resolveSpecSourcePath in traceParser.ts),
+        // so the in-place healing overwrite always targets the same file
+        // Playwright actually ran and failed.
+        const resolvedSpecPath = resolveSpecSourcePath(spec.file) || spec.file || 'unknown-spec';
 
         // Deduplicate by specPath: keep the first failure recorded for a
         // given spec file so we never re-process (and re-fix) the same file
@@ -158,10 +290,31 @@ function collectFailedSpecsFromReport(report: PlaywrightJsonReport): FailedSpecI
 
         const errorLog = finalResult.error?.message || finalResult.errors?.[0]?.message;
 
+        // Detect visual regression (screenshot/pixel-diff) failures so they
+        // can be routed into "Visual Diff Handoff" mode instead of the
+        // normal LLM code-repair flow — adjusting selectors/actions can
+        // never fix a genuine pixel discrepancy.
+        const isVisual = isVisualRegressionFailure(errorLog);
+        let visualDiff: VisualDiffArtifacts | undefined;
+        if (isVisual) {
+          // Scan every attempt (most-recent first) for the expected/actual/
+          // diff PNGs, mirroring the trace-attachment lookup above, in case
+          // they don't happen to live on the final result entry.
+          for (let i = results.length - 1; i >= 0; i--) {
+            const candidate = extractVisualDiffArtifacts(results[i].attachments);
+            if (candidate.expectedPath || candidate.actualPath || candidate.diffPath) {
+              visualDiff = candidate;
+              break;
+            }
+          }
+        }
+
         failuresBySpec.set(resolvedSpecPath, {
           specPath: resolvedSpecPath,
           traceZipPath: traceAttachment?.path,
           errorLog,
+          isVisualRegression: isVisual,
+          visualDiff,
         });
       }
     }
@@ -178,11 +331,66 @@ function collectFailedSpecsFromReport(report: PlaywrightJsonReport): FailedSpecI
   return Array.from(failuresBySpec.values());
 }
 
+/**
+ * Resolves the single shared run identifier that every worker/spec in this
+ * Playwright execution should be tagged with, so that a multi-worker run
+ * (see `shorky-test-consumer`'s `workers` config) still produces ONE batch
+ * report / consolidated PR / telemetry dispatch instead of fragmenting per
+ * worker.
+ *
+ * Resolution order (first match wins):
+ *   1. `SHORKY_RUN_ID` env var — set directly by the caller (e.g. an
+ *      orchestrating CI step), or inherited from the Playwright test
+ *      process if `fixTrace.ts` happens to run as a child of it.
+ *   2. `<reportDir>/.shorky-run-id` — the file written by the consuming
+ *      project's `global-setup.ts` *before* Playwright forks any worker
+ *      process. Since `globalSetup` runs once in the parent process prior
+ *      to worker spawn, every worker inherits the same in-memory
+ *      `SHORKY_RUN_ID`, and this file lets that identifier survive across
+ *      process boundaries into this separate `fixTrace.ts` invocation
+ *      (which typically runs as its own GitHub Actions step/process, after
+ *      the Playwright process has already exited).
+ *   3. A freshly minted UUID — used only when neither of the above is
+ *      available (e.g. local ad-hoc runs without global-setup.ts wired up),
+ *      preserving the previous behavior for those cases.
+ */
+function resolveSuiteRunId(reportPath: string): string {
+  if (process.env.SHORKY_RUN_ID) {
+    console.log(`🆔 [Diagnostic] Reusing shared suiteRunId="${process.env.SHORKY_RUN_ID}" from SHORKY_RUN_ID env var.`);
+    return process.env.SHORKY_RUN_ID;
+  }
+
+  const runIdFilePath = path.join(path.dirname(path.resolve(reportPath)), '.shorky-run-id');
+  if (fs.existsSync(runIdFilePath)) {
+    const fileRunId = fs.readFileSync(runIdFilePath, 'utf-8').trim();
+    if (fileRunId) {
+      console.log(`🆔 [Diagnostic] Reusing shared suiteRunId="${fileRunId}" from ${runIdFilePath} (written by global-setup.ts before workers were spawned).`);
+      return fileRunId;
+    }
+  }
+
+  const generatedRunId = randomUUID();
+  console.log(`🆔 [Diagnostic] No shared SHORKY_RUN_ID env var or ${runIdFilePath} found — minting a fresh suiteRunId="${generatedRunId}".`);
+  return generatedRunId;
+}
+
 export interface RunReportFixOptions {
   reportPath: string;
 }
 
 export async function runReportFix({ reportPath }: RunReportFixOptions) {
+  // Pre-flight budget guard: abort BEFORE any LLM repair loop starts if the
+  // org's subscription is inactive (402) or its monthly token budget is
+  // exhausted (429). This gates the entire batch report run, since every
+  // failure in the report would otherwise trigger its own billable
+  // generateSpecFix() call. Fails the CI job normally (non-zero exit) with
+  // the reason logged, rather than proceeding into the LLM loop.
+  const preflight = await runPreflightCheck();
+  if (!preflight.ok) {
+    console.error(`🛑 [Shorky] Aborting self-healing run: ${preflight.message}`);
+    process.exit(1);
+  }
+
   const absoluteReportPath = path.resolve(reportPath);
 
   if (!fs.existsSync(absoluteReportPath)) {
@@ -190,7 +398,21 @@ export async function runReportFix({ reportPath }: RunReportFixOptions) {
     process.exit(1);
   }
 
-  console.log(`🔍 Resolving failed specs and traces from Playwright JSON report: ${reportPath}...`);
+  // Resolve (not mint) a single suite-wide runId to group all healed traces
+  // under one run card — reusing the exact identifier established by
+  // global-setup.ts before Playwright spawned its parallel workers whenever
+  // one is available, so a multi-worker run still produces one batch/PR.
+  // Every failure discovered in this report is processed with batchMode:
+  // true (see the runOfflineFix() call below) and shares this exact
+  // suiteRunId — no per-fix runId is ever minted while inside this function.
+  const suiteRunId = resolveSuiteRunId(reportPath);
+  console.log(`🔍 Resolving failed specs and traces from Playwright JSON report: ${reportPath} (Run ID: ${suiteRunId})...`);
+  // [DIAGNOSTIC] Explicitly print the execution mode and generated run ID at
+  // the very start of the batch run, before any spec is touched, so it's
+  // trivially clear in the logs which mode this invocation is running in
+  // and which single runId every fix in this run should be tagged with.
+  console.log(`🧭 [Diagnostic] runReportFix() starting — batchMode=true (enforced) for all specs in this report, suiteRunId="${suiteRunId}".`);
+
   const report: PlaywrightJsonReport = JSON.parse(fs.readFileSync(absoluteReportPath, 'utf-8'));
   const failures = collectFailedSpecsFromReport(report);
 
@@ -201,25 +423,66 @@ export async function runReportFix({ reportPath }: RunReportFixOptions) {
 
   console.log(`🎯 Found ${failures.length} failed test(s) in report.`);
 
-  for (const failure of failures) {
+  // Every fix generated during this run is staged (committed) onto the
+  // same shared healing branch (batchMode: true below) rather than each
+  // opening its own branch/PR. Once all failures have been processed, a
+  // single consolidated pull request is pushed containing every fix.
+  const healedFixes: HealedFixEntry[] = [];
+
+  for (const [index, failure] of failures.entries()) {
     console.log(`\n🎯 Target Spec: ${failure.specPath}`);
     console.log(`📦 Trace Zip: ${failure.traceZipPath || 'N/A'}`);
     if (failure.errorLog) {
       console.log(`💥 Error: ${failure.errorLog}`);
     }
+    // [DIAGNOSTIC] Announce, per fix, that it is being processed on the
+    // consolidated (batch) path with the shared suiteRunId — this makes it
+    // trivial to spot in the logs if any given spec were ever (incorrectly)
+    // diverted onto an individual/fallback path with its own runId.
+    console.log(
+      `🔗 [Diagnostic] Fix ${index + 1}/${failures.length} ("${failure.specPath}") entering the CONSOLIDATED batch path — batchMode=true, runId="${suiteRunId}" (no individual PR or unique runId will be generated for this spec).`
+    );
 
-    // Completely removed duplicate pre-telemetry ping (`dispatchFailureTelemetry`) 
-    // to stop the triplet job expansion. Only run the offline fix cycle.
+    if (failure.isVisualRegression) {
+      console.log(`🖼️ Detected a visual regression failure for ${failure.specPath}. Bypassing LLM code repair (Visual Diff Handoff).`);
+      if (failure.visualDiff?.expectedPath) console.log(`   - Expected: ${failure.visualDiff.expectedPath}`);
+      if (failure.visualDiff?.actualPath) console.log(`   - Actual:   ${failure.visualDiff.actualPath}`);
+      if (failure.visualDiff?.diffPath) console.log(`   - Diff:     ${failure.visualDiff.diffPath}`);
 
-    // Playwright's JSON reporter emits absolute attachment paths by default,
-    // but resolve defensively (relative to cwd) in case a report was
-    // generated with relative paths or moved between machines.
+      const visualHandoffFix: HealedFixEntry = {
+        specPath: failure.specPath,
+        explanation:
+          'Visual regression detected — code-level repair skipped. Review the pixel diff artifacts and update the baseline snapshot or fix the UI as appropriate.',
+        errorLog: failure.errorLog,
+        isVisualRegression: true,
+        visualDiff: failure.visualDiff,
+      };
+
+      try {
+        stageHealingFix(visualHandoffFix);
+        console.log(`🌿 [Diagnostic] Staged visual diff handoff entry for "${failure.specPath}" onto the shared consolidated healing branch (no PR opened yet).`);
+      } catch (err: any) {
+        console.warn(`⚠️ Failed to stage the visual diff handoff entry for ${failure.specPath}:`, err.message || err);
+      }
+      healedFixes.push(visualHandoffFix);
+      continue;
+    }
+
     const resolvedTraceZipPath = failure.traceZipPath ? path.resolve(failure.traceZipPath) : undefined;
     const resolvedSpecFsPath = path.resolve(failure.specPath);
 
     if (resolvedTraceZipPath && fs.existsSync(resolvedTraceZipPath) && fs.existsSync(resolvedSpecFsPath)) {
       try {
-        await runOfflineFix({ tracePath: resolvedTraceZipPath, specPath: failure.specPath });
+        const healedFix = await runOfflineFix({
+          tracePath: resolvedTraceZipPath,
+          specPath: failure.specPath,
+          batchMode: true,
+          runId: suiteRunId,
+        });
+        if (healedFix) {
+          healedFixes.push(healedFix);
+          console.log(`✅ [Diagnostic] Fix for "${failure.specPath}" collected into the batch (total staged so far: ${healedFixes.length}). Still no PR/webhook fired — deferred until the batch loop completes.`);
+        }
       } catch (err) {
         console.error(`❌ Error running fixTrace for ${failure.specPath}:`, err instanceof Error ? err.message : err);
       }
@@ -231,28 +494,123 @@ export async function runReportFix({ reportPath }: RunReportFixOptions) {
       if (!fs.existsSync(resolvedSpecFsPath)) {
         missing.push(`spec file (${resolvedSpecFsPath})`);
       }
-      console.warn(`⚠️ Skipping offline fix for ${failure.specPath} — missing on disk: ${missing.join(', ')}.`);
+      console.warn(`⚠️ Skipping offline fix for ${failure.specPath} — missing on disk: ${missing.join(', ')}. [Diagnostic] No individual fallback path is taken here; this spec is simply omitted from the batch.`);
     }
   }
+
+  if (healedFixes.length === 0) {
+    console.log('ℹ️ No fixes were successfully generated. Skipping pull request creation.');
+    return;
+  }
+
+  // [DIAGNOSTIC] Print the full aggregated batch structure exactly once,
+  // right before it is handed to the GitHub API (pushConsolidatedHealingBranch)
+  // and to notifyShorkyCloudBatch. This is the definitive proof point that
+  // all N fixes collected during the loop above are being aggregated into a
+  // single call rather than leaking into per-fix PR/webhook calls.
+  console.log(
+    `📦 [Diagnostic] Aggregated batch payload (${healedFixes.length} fix(es), suiteRunId="${suiteRunId}") about to be sent as ONE consolidated branch push / GitHub API PR call:`,
+    JSON.stringify(
+      healedFixes.map((fix) => ({ specPath: fix.specPath, isVisualRegression: !!fix.isVisualRegression, hasFixedCode: !!fix.fixedCode })),
+      null,
+      2
+    )
+  );
+
+  console.log(`\n📦 Pushing consolidated healing branch with ${healedFixes.length} fix(es)...`);
+  const prUrl = await pushConsolidatedHealingBranch(healedFixes);
+
+  if (!prUrl) {
+    console.warn(
+      `⚠️ No pull request was opened for ${healedFixes.length} healed spec(s). Ensure GITHUB_TOKEN and GITHUB_REPOSITORY are set, and that the workflow grants "contents: write" and "pull-requests: write" permissions.`
+    );
+  } else {
+    console.log(`✅ [Diagnostic] Exactly one consolidated pull request handled for this batch run: ${prUrl}`);
+  }
+
+  // Notify shorky-cloud of every code fix in this batch. Each dispatch uses
+  // the schema-required flat { specPath, fixedCode, explanation } shape (see
+  // notifyShorkyCloudBatch's doc comment for why a single nested payload
+  // isn't viable against shorky-cloud's current Zod schema), but all share
+  // the same suiteRunId so they're grouped under a single run card rather
+  // than registering a separate run per spec.
+  await notifyShorkyCloudBatch(healedFixes, suiteRunId);
 }
 
 export interface RunOfflineFixOptions {
   tracePath: string;
   specPath: string;
+  batchMode?: boolean;
+  runId?: string;
+  /**
+   * Set by callers (e.g. `src/cli/index.ts`'s `handleHealOnFailure()`) that
+   * have already performed `runPreflightCheck()` themselves immediately
+   * before invoking this function, so it isn't repeated as a redundant
+   * network call. Defaults to false so any other caller (including
+   * `fixTrace.ts` invoked directly as its own CLI entrypoint, per
+   * `action.yml`) is still guarded even if it forgets to check first.
+   */
+  skipPreflightCheck?: boolean;
 }
 
-export async function runOfflineFix({ tracePath, specPath }: RunOfflineFixOptions) {
+export async function runOfflineFix({
+  tracePath,
+  specPath,
+  batchMode = false,
+  runId,
+  skipPreflightCheck = false,
+}: RunOfflineFixOptions): Promise<HealedFixEntry | null> {
+  // Pre-flight budget guard: only run here for the standalone (non-batch)
+  // --trace/--spec invocation. Batch runs (runReportFix) already perform
+  // this check exactly once before the loop that calls runOfflineFix() for
+  // each failure — re-checking per-spec here would be redundant network
+  // calls and could abort mid-batch after some fixes already succeeded.
+  if (!batchMode && !skipPreflightCheck) {
+    const preflight = await runPreflightCheck();
+    if (!preflight.ok) {
+      console.error(`🛑 [Shorky] Aborting self-healing run: ${preflight.message}`);
+      process.exit(1);
+    }
+  }
+
   const absoluteTracePath = path.resolve(tracePath);
   const absoluteSpecPath = path.resolve(specPath);
 
+  // Hard invariant: in batch mode, the caller (runReportFix) MUST supply the
+  // shared suiteRunId explicitly. Silently falling through to a fresh
+  // randomUUID() here — even just once — would mint a unique run ID for
+  // this single fix, which is the exact root cause of split Neon run
+  // records across a single batch report run. Fail loudly instead of
+  // silently generating a divergent runId.
+  if (batchMode && !runId) {
+    throw new Error(
+      `runOfflineFix() invariant violation: batchMode=true but no runId was supplied for "${specPath}". Every fix processed during a batch run must reuse the caller's shared suiteRunId — refusing to fall back to a freshly generated UUID.`
+    );
+  }
+
+  const effectiveRunId = runId || randomUUID();
+
+  // [DIAGNOSTIC] Print the evaluated batchMode flag and the runId this
+  // invocation will actually use. When called from runReportFix(), batchMode
+  // must always be `true` and `runId` must always equal the caller's
+  // suiteRunId — if effectiveRunId ever differs from a passed-in `runId`,
+  // that means `runId` was falsy and a brand-new UUID was minted here,
+  // which is exactly the root cause of split Neon run IDs.
+  console.log(
+    `🧪 [Diagnostic] runOfflineFix("${specPath}") — batchMode=${batchMode}, incoming runId=${runId ? `"${runId}"` : 'undefined'}, effectiveRunId="${effectiveRunId}"` +
+      (runId && runId !== effectiveRunId ? ' ⚠️ MISMATCH — a new UUID was generated instead of reusing the shared runId!' : '')
+  );
+
   if (!fs.existsSync(absoluteTracePath)) {
     console.error(`❌ Trace file not found: ${absoluteTracePath}`);
-    process.exit(1);
+    if (!batchMode) process.exit(1);
+    return null;
   }
 
   if (!fs.existsSync(absoluteSpecPath)) {
     console.error(`❌ Spec file not found: ${absoluteSpecPath}`);
-    process.exit(1);
+    if (!batchMode) process.exit(1);
+    return null;
   }
 
   console.log(`🔍 Unpacking and analyzing trace: ${tracePath}...`);
@@ -267,6 +625,41 @@ export async function runOfflineFix({ tracePath, specPath }: RunOfflineFixOption
     console.log(`   - Error: ${failureContext.errorMessage}`);
   }
 
+  if (isVisualRegressionFailure(failureContext.errorMessage)) {
+    console.log(`🖼️ Detected a visual regression failure for ${specPath}. Bypassing LLM code repair (Visual Diff Handoff).`);
+
+    const visualHandoffFix: HealedFixEntry = {
+      specPath,
+      explanation:
+        'Visual regression detected — code-level repair skipped. Review the pixel diff artifacts and update the baseline snapshot or fix the UI as appropriate.',
+      errorLog: failureContext.errorMessage,
+      isVisualRegression: true,
+    };
+
+    if (batchMode) {
+      console.log(`🔗 [Diagnostic] "${specPath}" (visual regression) entering the CONSOLIDATED path — staging only, no individual PR.`);
+      try {
+        stageHealingFix(visualHandoffFix);
+      } catch (err: any) {
+        console.warn(`⚠️ Failed to stage the visual diff handoff entry for ${specPath}:`, err.message || err);
+      }
+    } else {
+      // [DIAGNOSTIC] This is the INDIVIDUAL PR fallback path. It must only
+      // ever be reached for the standalone (--trace/--spec) CLI flow, never
+      // from a batch runReportFix() run — that's what causes the "split
+      // run IDs" / duplicate individual PR bug (e.g. PR #42, #43) when it
+      // fires per spec during batch processing.
+      console.warn(`🚨 [Diagnostic] "${specPath}" (visual regression) is entering the INDIVIDUAL PR fallback path (batchMode=false). This must never happen during a batch report run.`);
+      assertIndividualPrAllowed(specPath, batchMode);
+      const prUrl = await openHealingPullRequest(visualHandoffFix);
+      if (!prUrl) {
+        console.warn(`⚠️ No pull request was opened for the visual regression review entry for ${specPath}.`);
+      }
+    }
+
+    return visualHandoffFix;
+  }
+
   console.log(`\n🤖 Sending failure context & ${specPath} to LLM Fixer...`);
   const originalSpecCode = fs.readFileSync(absoluteSpecPath, 'utf-8');
 
@@ -277,33 +670,75 @@ export async function runOfflineFix({ tracePath, specPath }: RunOfflineFixOption
   console.log(`\n--- Code Diff Preview ---`);
   console.log(fixResult.fixedCode);
 
-  const cleaned = sanitizeGeneratedCode(fixResult.fixedCode);
-  
-  // Guardrail: Prevent wiping out test code with empty or truncated outputs
-  if (!cleaned || cleaned.length < 30 || !cleaned.includes('test(')) {
-    console.error(`❌ Error: LLM generated invalid or empty spec code for ${specPath}. Aborting file write to protect test file.`);
-    return;
+  const overwriteResult = overwriteSpecInPlace({
+    specPath: absoluteSpecPath,
+    rawFixedCode: fixResult.fixedCode,
+  });
+
+  if (!overwriteResult.written) {
+    console.error(`❌ Error: ${overwriteResult.reason}`);
+    return null;
   }
 
-  fs.writeFileSync(absoluteSpecPath, cleaned, 'utf-8');
   console.log(`\n🎉 Successfully patched: ${specPath}`);
 
-  // Single unified webhook dispatch containing the genuine fix payload
-  await notifyShorkyCloud(
+  const healedFix: HealedFixEntry = {
     specPath,
-    { fixedCode: cleaned, explanation: fixResult.explanation },
-    absoluteTracePath,
-    failureContext.errorMessage
-  );
-}
+    explanation: fixResult.explanation,
+    errorLog: failureContext.errorMessage,
+    fixedCode: overwriteResult.cleanedCode,
+    traceZipPath: absoluteTracePath,
+    // Extracted from generateSpecFix()'s FixResult (response.usage.total_tokens
+    // in codeFixer.ts) -- carried through so the webhook dispatch below
+    // (standalone path) / notifyShorkyCloudBatch (batch path) can report it
+    // to shorky-cloud's /api/webhook for the tokensUsedThisMonth budget guard.
+    tokensUsed: fixResult.tokensUsed,
+  };
 
-function sanitizeGeneratedCode(rawCode: string): string {
-  return rawCode
-    .replace(/^```[a-z]*\n?/i, '')
-    .replace(/\n?```$/i, '')
-    .replace(/^\/\/\s*[^\n]*\.spec\.[tj]s\n?/i, '')
-    .replace(/\r\n/g, '\n')
-    .trim() + '\n';
+  if (batchMode) {
+    // Batch report mode: only stage the fix onto the shared consolidated
+    // healing branch. Individual PR creation and per-spec webhook dispatch
+    // are intentionally skipped here — `runReportFix` pushes exactly one
+    // consolidated branch/PR and fires exactly one consolidated webhook
+    // once every failure in the report has been processed.
+    console.log(`🔗 [Diagnostic] "${specPath}" entering the CONSOLIDATED path — staging only (batchMode=true, runId="${effectiveRunId}"). openHealingPullRequest() will NOT be called for this spec.`);
+    try {
+      stageHealingFix(healedFix);
+      console.log(`🌿 Staged fix for ${specPath} on the consolidated healing branch.`);
+    } catch (err: any) {
+      console.warn(`⚠️ Failed to stage the auto-healing fix for ${specPath}:`, err.message || err);
+    }
+  } else {
+    // [DIAGNOSTIC] This is the INDIVIDUAL PR fallback path — reachable only
+    // from the standalone (--trace/--spec) CLI invocation, never from
+    // runReportFix()'s batch loop (which always passes batchMode: true).
+    // If this ever logs during a batch/report-driven CI run, that is the
+    // exact root cause of duplicate individual PRs (#42, #43, ...) and
+    // per-spec runIds splitting the Neon run record.
+    console.warn(`🚨 [Diagnostic] "${specPath}" is entering the INDIVIDUAL PR fallback path (batchMode=false) with its own runId="${effectiveRunId}". This must never happen during a batch report run.`);
+    assertIndividualPrAllowed(specPath, batchMode);
+    const prUrl = await openHealingPullRequest(healedFix);
+    if (!prUrl) {
+      console.warn(
+        `⚠️ No pull request was opened for ${specPath}. Ensure GITHUB_TOKEN and GITHUB_REPOSITORY are set, and that the workflow grants "contents: write" and "pull-requests: write" permissions.`
+      );
+    }
+
+    // Dispatch the per-spec webhook only for the standalone (non-batch)
+    // single-fix flow. Batch runs are notified once, in aggregate, from
+    // `runReportFix` after the consolidated PR is opened.
+    await notifyShorkyCloud(
+      specPath,
+      { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation },
+      absoluteTracePath,
+      failureContext.errorMessage,
+      effectiveRunId,
+      fixResult.tokensUsed
+    );
+    logDashboardCallToAction();
+  }
+
+  return healedFix;
 }
 
 if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('src/cli/fixTrace.ts')) {

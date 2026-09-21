@@ -5,6 +5,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.findLatestTraceZip = findLatestTraceZip;
 exports.extractSpecPathFromTrace = extractSpecPathFromTrace;
+exports.isVisualRegressionFailure = isVisualRegressionFailure;
+exports.resolveSpecSourcePath = resolveSpecSourcePath;
 exports.parsePlaywrightTrace = parsePlaywrightTrace;
 // src/engine/traceParser.ts
 const fs_1 = __importDefault(require("fs"));
@@ -66,6 +68,53 @@ function extractSpecPathFromTrace(traceZipPath, testDir = 'tests') {
         }
     }
     return null;
+}
+/**
+ * Returns true when the provided error message indicates a Playwright
+ * visual regression / screenshot comparison failure (e.g. a
+ * `toHaveScreenshot`/`toMatchSnapshot` pixel-diff mismatch) rather than a
+ * DOM interaction, selector, or navigation failure.
+ *
+ * This is used to route visual failures into "Visual Diff Handoff" mode
+ * instead of attempting invalid, code-level LLM repairs (adjusting
+ * selectors/actions can never fix a genuine pixel discrepancy, and doing so
+ * previously caused a re-fail -> re-heal infinite loop).
+ */
+function isVisualRegressionFailure(errorMessage) {
+    if (!errorMessage)
+        return false;
+    return /toHaveScreenshot|toMatchSnapshot|maxDiffPixelRatio|maxDiffPixels|pixelmatch|screenshot comparison failed|pixels?\s*\(ratio [\d.]+ of all image pixels\) are different/i.test(errorMessage);
+}
+/**
+ * Maps a raw `spec.file` value from a Playwright JSON report entry back to
+ * the exact original source test file path on disk, so downstream healing
+ * logic (fixTrace.ts) always overwrites the *same* file that Playwright
+ * actually ran and failed — never a differently-named or unreferenced file.
+ *
+ * Handles both of the shapes the JSON reporter can emit:
+ *  - an absolute path (resolved relative to `process.cwd()`)
+ *  - an already-relative path (used as-is)
+ *
+ * and normalizes it so it is rooted at `testDir` (default "tests"), matching
+ * how Playwright's `testDir` config option lays out spec files, without
+ * double-prefixing paths that already include it.
+ */
+function resolveSpecSourcePath(rawSpecFile, testDir = 'tests') {
+    if (!rawSpecFile)
+        return '';
+    let relativeSpecPath = path_1.default.isAbsolute(rawSpecFile)
+        ? path_1.default.relative(process.cwd(), rawSpecFile)
+        : rawSpecFile;
+    const normalizedTestDir = testDir.replace(/[\\/]+$/, '');
+    const testDirPrefix = normalizedTestDir + path_1.default.sep;
+    const testDirPrefixPosix = normalizedTestDir + '/';
+    if (relativeSpecPath &&
+        !relativeSpecPath.startsWith(testDirPrefix) &&
+        !relativeSpecPath.startsWith(testDirPrefixPosix) &&
+        relativeSpecPath !== normalizedTestDir) {
+        relativeSpecPath = path_1.default.join(normalizedTestDir, relativeSpecPath);
+    }
+    return relativeSpecPath || rawSpecFile;
 }
 async function parsePlaywrightTrace(traceZipPath) {
     const extractDir = path_1.default.join(process.cwd(), '.shorky-temp-trace');

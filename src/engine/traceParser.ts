@@ -84,6 +84,61 @@ export function extractSpecPathFromTrace(traceZipPath: string, testDir = 'tests'
   return null;
 }
 
+/**
+ * Returns true when the provided error message indicates a Playwright
+ * visual regression / screenshot comparison failure (e.g. a
+ * `toHaveScreenshot`/`toMatchSnapshot` pixel-diff mismatch) rather than a
+ * DOM interaction, selector, or navigation failure.
+ *
+ * This is used to route visual failures into "Visual Diff Handoff" mode
+ * instead of attempting invalid, code-level LLM repairs (adjusting
+ * selectors/actions can never fix a genuine pixel discrepancy, and doing so
+ * previously caused a re-fail -> re-heal infinite loop).
+ */
+export function isVisualRegressionFailure(errorMessage?: string | null): boolean {
+  if (!errorMessage) return false;
+  return /toHaveScreenshot|toMatchSnapshot|maxDiffPixelRatio|maxDiffPixels|pixelmatch|screenshot comparison failed|pixels?\s*\(ratio [\d.]+ of all image pixels\) are different/i.test(
+    errorMessage
+  );
+}
+
+/**
+ * Maps a raw `spec.file` value from a Playwright JSON report entry back to
+ * the exact original source test file path on disk, so downstream healing
+ * logic (fixTrace.ts) always overwrites the *same* file that Playwright
+ * actually ran and failed — never a differently-named or unreferenced file.
+ *
+ * Handles both of the shapes the JSON reporter can emit:
+ *  - an absolute path (resolved relative to `process.cwd()`)
+ *  - an already-relative path (used as-is)
+ *
+ * and normalizes it so it is rooted at `testDir` (default "tests"), matching
+ * how Playwright's `testDir` config option lays out spec files, without
+ * double-prefixing paths that already include it.
+ */
+export function resolveSpecSourcePath(rawSpecFile: string | undefined, testDir = 'tests'): string {
+  if (!rawSpecFile) return '';
+
+  let relativeSpecPath = path.isAbsolute(rawSpecFile)
+    ? path.relative(process.cwd(), rawSpecFile)
+    : rawSpecFile;
+
+  const normalizedTestDir = testDir.replace(/[\\/]+$/, '');
+  const testDirPrefix = normalizedTestDir + path.sep;
+  const testDirPrefixPosix = normalizedTestDir + '/';
+
+  if (
+    relativeSpecPath &&
+    !relativeSpecPath.startsWith(testDirPrefix) &&
+    !relativeSpecPath.startsWith(testDirPrefixPosix) &&
+    relativeSpecPath !== normalizedTestDir
+  ) {
+    relativeSpecPath = path.join(normalizedTestDir, relativeSpecPath);
+  }
+
+  return relativeSpecPath || rawSpecFile;
+}
+
 export async function parsePlaywrightTrace(traceZipPath: string): Promise<TraceFailureContext> {
   const extractDir = path.join(process.cwd(), '.shorky-temp-trace');
 
