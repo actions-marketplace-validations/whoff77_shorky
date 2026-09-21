@@ -7,6 +7,7 @@ import { getShorkyCloudApiKey, getShorkyCloudWebhookUrl, logDashboardCallToActio
 import { runPreflightCheck } from './preflight';
 import { HealedFixEntry, openHealingPullRequest, pushConsolidatedHealingBranch, stageHealingFix } from '../utils/githubPr';
 import { overwriteSpecInPlace } from '../agent/generator';
+import { resolveRepositoryName } from '../utils/gitContext';
 
 import dotenv from 'dotenv';
 dotenv.config();
@@ -44,15 +45,17 @@ async function notifyShorkyCloud(
   traceZipPath?: string | null,
   errorLog?: string | null,
   runId?: string,
+  testName?: string | null,
   tokensUsed?: number
 ) {
-  const [repoOwner, repoName] = (process.env.GITHUB_REPOSITORY || 'owner/repo').split('/');
+  const [repoOwner, repoName] = resolveRepositoryName().split('/');
   const sanitizedSpecPath = specPath.replace(/^\/+/, '');
   const payload = {
     repoOwner,
     repoName,
     branch: process.env.GITHUB_REF_NAME || process.env.BRANCH || 'main',
     specPath: sanitizedSpecPath,
+    testName: testName || undefined,
     traceZipPath: traceZipPath || null,
     errorLog: errorLog || null,
     fixedCode: fixResult.fixedCode,
@@ -153,6 +156,7 @@ async function notifyShorkyCloudBatch(
       fix.traceZipPath,
       fix.errorLog,
       runId,
+      fix.testName,
       fix.tokensUsed
     );
   }
@@ -634,6 +638,7 @@ export async function runOfflineFix({
         'Visual regression detected — code-level repair skipped. Review the pixel diff artifacts and update the baseline snapshot or fix the UI as appropriate.',
       errorLog: failureContext.errorMessage,
       isVisualRegression: true,
+      testName: failureContext.testTitle || path.basename(specPath),
     };
 
     if (batchMode) {
@@ -682,12 +687,20 @@ export async function runOfflineFix({
 
   console.log(`\n🎉 Successfully patched: ${specPath}`);
 
+  // Prefer the test title actually extracted from the trace's own metadata
+  // (matches the exact `TestCase.title` format cloudReporter.ts sends via
+  // `/api/v1/telemetry`); fall back to the spec's basename only when the
+  // trace didn't carry a title (e.g. an unexpected/older trace layout), so
+  // the webhook payload's `testName` is never left empty.
+  const resolvedTestName = failureContext.testTitle || path.basename(specPath);
+
   const healedFix: HealedFixEntry = {
     specPath,
     explanation: fixResult.explanation,
     errorLog: failureContext.errorMessage,
     fixedCode: overwriteResult.cleanedCode,
     traceZipPath: absoluteTracePath,
+    testName: resolvedTestName,
     // Extracted from generateSpecFix()'s FixResult (response.usage.total_tokens
     // in codeFixer.ts) -- carried through so the webhook dispatch below
     // (standalone path) / notifyShorkyCloudBatch (batch path) can report it
@@ -733,6 +746,7 @@ export async function runOfflineFix({
       absoluteTracePath,
       failureContext.errorMessage,
       effectiveRunId,
+      resolvedTestName,
       fixResult.tokensUsed
     );
     logDashboardCallToAction();

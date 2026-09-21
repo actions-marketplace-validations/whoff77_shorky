@@ -14,6 +14,7 @@ const shorkyCloud_1 = require("../config/shorkyCloud");
 const preflight_1 = require("./preflight");
 const githubPr_1 = require("../utils/githubPr");
 const generator_1 = require("../agent/generator");
+const gitContext_1 = require("../utils/gitContext");
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
 /**
@@ -40,14 +41,15 @@ function assertIndividualPrAllowed(specPath, batchMode) {
  * see `notifyShorkyCloudBatch` — so a single report with N failed specs
  * only ever produces one webhook call, not N.
  */
-async function notifyShorkyCloud(specPath, fixResult, traceZipPath, errorLog, runId, tokensUsed) {
-    const [repoOwner, repoName] = (process.env.GITHUB_REPOSITORY || 'owner/repo').split('/');
+async function notifyShorkyCloud(specPath, fixResult, traceZipPath, errorLog, runId, testName, tokensUsed) {
+    const [repoOwner, repoName] = (0, gitContext_1.resolveRepositoryName)().split('/');
     const sanitizedSpecPath = specPath.replace(/^\/+/, '');
     const payload = {
         repoOwner,
         repoName,
         branch: process.env.GITHUB_REF_NAME || process.env.BRANCH || 'main',
         specPath: sanitizedSpecPath,
+        testName: testName || undefined,
         traceZipPath: traceZipPath || null,
         errorLog: errorLog || null,
         fixedCode: fixResult.fixedCode,
@@ -127,8 +129,12 @@ async function notifyShorkyCloudBatch(fixes, runId) {
     }
     for (const fix of notifiable) {
         console.log(`➡️  [Diagnostic] Notifying shorky-cloud for "${fix.specPath}" using shared batch runId="${runId}" (consolidated path — no per-fix runId is generated here).`);
-        await notifyShorkyCloud(fix.specPath, { fixedCode: fix.fixedCode, explanation: fix.explanation }, fix.traceZipPath, fix.errorLog, runId, fix.tokensUsed);
+        await notifyShorkyCloud(fix.specPath, { fixedCode: fix.fixedCode, explanation: fix.explanation }, fix.traceZipPath, fix.errorLog, runId, fix.testName, fix.tokensUsed);
     }
+    // Single summary CTA for the whole batch, printed once after every fix in
+    // this run has been dispatched (rather than per-fix, which would spam the
+    // log with the same line N times for an N-fix batch).
+    (0, shorkyCloud_1.logDashboardCallToAction)();
 }
 /**
  * Extracts the expected/actual/diff PNG attachment paths Playwright records
@@ -472,6 +478,7 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
             explanation: 'Visual regression detected — code-level repair skipped. Review the pixel diff artifacts and update the baseline snapshot or fix the UI as appropriate.',
             errorLog: failureContext.errorMessage,
             isVisualRegression: true,
+            testName: failureContext.testTitle || path_1.default.basename(specPath),
         };
         if (batchMode) {
             console.log(`🔗 [Diagnostic] "${specPath}" (visual regression) entering the CONSOLIDATED path — staging only, no individual PR.`);
@@ -513,12 +520,19 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
         return null;
     }
     console.log(`\n🎉 Successfully patched: ${specPath}`);
+    // Prefer the test title actually extracted from the trace's own metadata
+    // (matches the exact `TestCase.title` format cloudReporter.ts sends via
+    // `/api/v1/telemetry`); fall back to the spec's basename only when the
+    // trace didn't carry a title (e.g. an unexpected/older trace layout), so
+    // the webhook payload's `testName` is never left empty.
+    const resolvedTestName = failureContext.testTitle || path_1.default.basename(specPath);
     const healedFix = {
         specPath,
         explanation: fixResult.explanation,
         errorLog: failureContext.errorMessage,
         fixedCode: overwriteResult.cleanedCode,
         traceZipPath: absoluteTracePath,
+        testName: resolvedTestName,
         // Extracted from generateSpecFix()'s FixResult (response.usage.total_tokens
         // in codeFixer.ts) -- carried through so the webhook dispatch below
         // (standalone path) / notifyShorkyCloudBatch (batch path) can report it
@@ -556,7 +570,8 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
         // Dispatch the per-spec webhook only for the standalone (non-batch)
         // single-fix flow. Batch runs are notified once, in aggregate, from
         // `runReportFix` after the consolidated PR is opened.
-        await notifyShorkyCloud(specPath, { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation }, absoluteTracePath, failureContext.errorMessage, effectiveRunId, fixResult.tokensUsed);
+        await notifyShorkyCloud(specPath, { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation }, absoluteTracePath, failureContext.errorMessage, effectiveRunId, resolvedTestName, fixResult.tokensUsed);
+        (0, shorkyCloud_1.logDashboardCallToAction)();
     }
     return healedFix;
 }

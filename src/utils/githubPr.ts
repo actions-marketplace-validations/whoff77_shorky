@@ -35,6 +35,15 @@ export interface HealedFixEntry {
   /** Absolute path to the trace.zip analyzed for this fix, for webhook telemetry. */
   traceZipPath?: string;
   /**
+   * The Playwright test title (e.g. "user should be able to log in"),
+   * extracted from the trace's metadata by `traceParser.ts`. Sent as
+   * `testName` in the shorky-cloud webhook payload so it matches the exact
+   * identifier `cloudReporter.ts` sends via `/api/v1/telemetry` for the same
+   * test, keeping the dashboard's test identifiers consistent across both
+   * dispatch paths.
+   */
+  testName?: string;
+  /**
    * LLM tokens consumed generating this fix (`FixResult.tokensUsed`, from
    * `codeFixer.ts`'s `response.usage.total_tokens`), 0/undefined when
    * unavailable (e.g. visual-regression handoff entries, which never call

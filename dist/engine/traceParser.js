@@ -13,6 +13,45 @@ const fs_1 = __importDefault(require("fs"));
 const path_1 = __importDefault(require("path"));
 const unzipper_1 = __importDefault(require("unzipper"));
 /**
+ * Scans every `*-trace.trace` file inside an already-extracted trace
+ * directory for a `context-options` metadata line carrying a `title` field
+ * (Playwright embeds `"<spec file>:<line> › <test title>"` there for the
+ * "library"-origin per-browser-context trace file, distinct from the
+ * top-level `test.trace`/testRunner-origin file which has no title), and
+ * returns just the test title portion (after the last `›`), trimmed.
+ *
+ * Returns `undefined` if no trace file carries a title (e.g. malformed or
+ * unexpected trace archive layout) rather than throwing.
+ */
+function extractTestTitleFromTraceDir(extractDir) {
+    try {
+        const traceFiles = fs_1.default
+            .readdirSync(extractDir)
+            .filter((f) => f.endsWith('-trace.trace') || f === 'trace.trace');
+        for (const file of traceFiles) {
+            const filePath = path_1.default.join(extractDir, file);
+            const firstLine = fs_1.default.readFileSync(filePath, 'utf-8').split('\n', 1)[0];
+            if (!firstLine)
+                continue;
+            try {
+                const event = JSON.parse(firstLine);
+                if (event.type === 'context-options' && typeof event.title === 'string' && event.title.trim()) {
+                    const rawTitle = event.title.trim();
+                    const segments = rawTitle.split('›');
+                    return segments[segments.length - 1].trim();
+                }
+            }
+            catch {
+                // ignore malformed first line, try the next trace file
+            }
+        }
+    }
+    catch {
+        // ignore filesystem errors, fall through to undefined
+    }
+    return undefined;
+}
+/**
  * Recursively locates the newest trace.zip file in test-results if no explicit path is given
  */
 function findLatestTraceZip(baseDir = 'test-results') {
@@ -128,6 +167,9 @@ async function parsePlaywrightTrace(traceZipPath) {
             .pipe(unzipper_1.default.Extract({ path: extractDir }))
             .promise();
         const failureContext = {};
+        // 0. Extract the test title from the trace metadata so callers can
+        // report a consistent test identifier (see extractTestTitleFromTraceDir).
+        failureContext.testTitle = extractTestTitleFromTraceDir(extractDir);
         // 1. Always inspect runner's error-context.md first (populated on timeout)
         const traceDir = path_1.default.dirname(traceZipPath);
         let runnerErrorMessage;
