@@ -16,7 +16,6 @@ export const SHORKY_TOKENS_ATTACHMENT_NAME = 'shorky-tokens-used';
 export type AutoHealFixtures = {
   autoHealPage: {
     page: Page;
-    clickAndHeal: (selector: string) => Promise<void>;
     assertVisual: (expectation: string) => Promise<void>;
     assertVisualBaseline: (snapshotName: string, options?: VisualDiffOptions) => Promise<void>;
   };
@@ -28,15 +27,6 @@ export const test = baseTest.extend<AutoHealFixtures>({
     // by a *previous* test sharing this worker process never bleed into
     // the current test's reported usage (see tokenUsage.ts).
     resetTokensUsedThisTest();
-
-    // Strict pass-through: no cache lookup, no fallback self-healing. Tests
-    // must fail using standard Playwright behavior (a normal timeout error)
-    // so `fixTrace.ts` can permanently repair the underlying source code
-    // instead of this fixture silently papering over a stale selector at
-    // runtime.
-    const clickAndHeal = async (selector: string) => {
-      await page.click(selector);
-    };
 
     const runVisualCheck = async (expectation: string) => {
       console.log(`👁️ [Shorky Vision] Auditing visual layout: "${expectation}"...`);
@@ -56,7 +46,6 @@ export const test = baseTest.extend<AutoHealFixtures>({
 
     await use({
       page,
-      clickAndHeal,
       assertVisual: runVisualCheck,
       assertVisualBaseline: runVisualBaseline,
     });

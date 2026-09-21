@@ -21,14 +21,6 @@ exports.test = test_1.test.extend({
         // by a *previous* test sharing this worker process never bleed into
         // the current test's reported usage (see tokenUsage.ts).
         (0, tokenUsage_1.resetTokensUsedThisTest)();
-        // Strict pass-through: no cache lookup, no fallback self-healing. Tests
-        // must fail using standard Playwright behavior (a normal timeout error)
-        // so `fixTrace.ts` can permanently repair the underlying source code
-        // instead of this fixture silently papering over a stale selector at
-        // runtime.
-        const clickAndHeal = async (selector) => {
-            await page.click(selector);
-        };
         const runVisualCheck = async (expectation) => {
             console.log(`👁️ [Shorky Vision] Auditing visual layout: "${expectation}"...`);
             const result = await (0, healingEngine_1.assertVisual)(page, expectation);
@@ -45,7 +37,6 @@ exports.test = test_1.test.extend({
         };
         await use({
             page,
-            clickAndHeal,
             assertVisual: runVisualCheck,
             assertVisualBaseline: runVisualBaseline,
         });
