@@ -1,18 +1,15 @@
 import { test, expect } from '@playwright/test';
 
-test.describe('Shorky Baseline Test Suite', () => {
-  test('Verify login page renders correctly', async ({ page }) => {
-    // Navigate to a reliable demo testing site
-    await page.goto('https://the-internet.herokuapp.com/login');
-    
-    // Assert page header visibility
-    const heading = page.locator('h2');
-    await expect(heading).toHaveText('Login Page');
+test('user should be able to log in', async ({ page }) => {
+  await page.goto('https://the-internet.herokuapp.com/login');
 
-    // Assert key form elements exist
-    await expect(page.locator('#username')).toBeVisible();
-    await expect(page.locator('#password')).toBeVisible();
-    await expect(page.locator('button[type="submit"]')).toBeVisible();
-  });
+  // Fill in the username and password fields using accessible role/label locators
+  await page.getByLabel('Username').fill('tomsmith');
+  await page.getByLabel('Password').fill('SuperSecretPassword!');
+
+  // Click the login button
+  await page.getByRole('button', { name: /Login/ }).click();
+
+  // Assert that the login was successful by checking the URL
+  await expect(page).toHaveURL('https://the-internet.herokuapp.com/secure');
 });
-
