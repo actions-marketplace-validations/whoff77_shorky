@@ -1,9 +1,7 @@
 import { test as baseTest, Page, expect } from '@playwright/test';
-import { healSelector, assertVisual } from '../utils/healingEngine';
+import { assertVisual } from '../utils/healingEngine';
 import { assertVisualBaseline, VisualDiffOptions } from '../utils/visual-diff';
 import { getTokensUsedThisTest, resetTokensUsedThisTest } from '../utils/tokenUsage';
-import * as fs from 'fs';
-import * as path from 'path';
 
 /**
  * Attachment name used to bridge LLM token usage from the worker process
@@ -14,28 +12,6 @@ import * as path from 'path';
  * for an attachment with this exact name.
  */
 export const SHORKY_TOKENS_ATTACHMENT_NAME = 'shorky-tokens-used';
-
-const REGISTRY_PATH = path.join(__dirname, 'healed-selectors.json');
-
-function loadRegistry(): Record<string, string> {
-  try {
-    if (fs.existsSync(REGISTRY_PATH)) {
-      const data = fs.readFileSync(REGISTRY_PATH, 'utf-8');
-      return JSON.parse(data || '{}');
-    }
-  } catch (err) {
-    console.error('⚠️ [Shorky] Failed to read healed-selectors.json', err);
-  }
-  return {};
-}
-
-function saveRegistry(registry: Record<string, string>) {
-  try {
-    fs.writeFileSync(REGISTRY_PATH, JSON.stringify(registry, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('⚠️ [Shorky] Failed to save healed-selectors.json', err);
-  }
-}
 
 export type AutoHealFixtures = {
   autoHealPage: {
@@ -53,28 +29,13 @@ export const test = baseTest.extend<AutoHealFixtures>({
     // the current test's reported usage (see tokenUsage.ts).
     resetTokensUsedThisTest();
 
+    // Strict pass-through: no cache lookup, no fallback self-healing. Tests
+    // must fail using standard Playwright behavior (a normal timeout error)
+    // so `fixTrace.ts` can permanently repair the underlying source code
+    // instead of this fixture silently papering over a stale selector at
+    // runtime.
     const clickAndHeal = async (selector: string) => {
-      const registry = loadRegistry();
-      const activeSelector = registry[selector] || selector;
-
-      if (registry[selector]) {
-        console.log(`⚡ [Shorky Cache] Using pre-healed selector: "${selector}" -> "${registry[selector]}"`);
-      }
-
-      try {
-        await page.click(activeSelector, { timeout: 3000 });
-      } catch (error) {
-        console.warn(`⚠️ [Shorky Interceptor] Selector failed: "${selector}". Initiating self-healing...`);
-
-        const healedSelector = await healSelector(page, selector);
-
-        console.log(`✨ [Shorky Healed] Replaced "${selector}" -> "${healedSelector}"`);
-
-        registry[selector] = healedSelector;
-        saveRegistry(registry);
-
-        await page.click(healedSelector);
-      }
+      await page.click(selector);
     };
 
     const runVisualCheck = async (expectation: string) => {

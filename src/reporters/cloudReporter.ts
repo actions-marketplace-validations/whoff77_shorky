@@ -1,8 +1,9 @@
 import { Reporter, FullConfig, Suite, TestCase, TestResult, FullResult } from '@playwright/test/reporter';
 import fs from 'fs';
 import path from 'path';
-import { getShorkyCloudApiKey, getShorkyCloudTelemetryUrl, isShorkyCloudEnabled } from '../config/shorkyCloud';
+import { getShorkyCloudApiKey, getShorkyCloudTelemetryUrl, isShorkyCloudEnabled, logDashboardCallToAction } from '../config/shorkyCloud';
 import { SHORKY_TOKENS_ATTACHMENT_NAME } from '../fixtures/autoHealFixture';
+import { resolveRepositoryName } from '../utils/gitContext';
 
 interface TestRunItem {
   title: string;
@@ -49,6 +50,7 @@ export default class ShorkyCloudReporter implements Reporter {
   onBegin(config: FullConfig, suite: Suite) {
     if (!this.apiKey) {
       console.log('ℹ️ [Shorky] SHORKY_CLOUD_API_KEY not found. Skipping cloud reporting.');
+      logDashboardCallToAction();
       return;
     }
     console.log('🚀 [Shorky] Initializing Shorky Cloud reporting run...');
@@ -101,9 +103,18 @@ export default class ShorkyCloudReporter implements Reporter {
       // tokensUsedThisMonth for the /api/v1/preflight budget guard.
       const totalTokensUsed = this.testItems.reduce((sum, item) => sum + item.tokensUsed, 0);
 
+      // Standardized repo identity (GITHUB_REPOSITORY -> local .git/config
+      // -> "local/unknown") — see gitContext.ts. Split into repoOwner/repoName
+      // and sent in the exact same shape `fixTrace.ts`'s notifyShorkyCloud()
+      // sends, so the dashboard shows a consistent repo identity for both
+      // the run-level telemetry (this reporter) and the per-fix webhook.
+      const [repoOwner, repoName] = resolveRepositoryName().split('/');
+
       // Construct the flattened payload matching shorky-cloud's Zod schema
       const telemetryPayload = {
         projectName: process.env.SHORKY_PROJECT_NAME || 'shorky',
+        repoOwner,
+        repoName,
         status: failedCount > 0 ? 'failed' : 'passed',
         passedCount,
         failedCount,
@@ -142,6 +153,7 @@ export default class ShorkyCloudReporter implements Reporter {
         console.error('⚠️ [Shorky Cloud] Backend responded with status:', response.status, JSON.stringify(errorData, null, 2));
       } else {
         console.log('✅ [Shorky Cloud] Telemetry successfully transmitted.');
+        logDashboardCallToAction();
       }
     } catch (error: any) {
       // Gracefully log offline status without throwing an unhandled stack trace
