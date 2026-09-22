@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const shorkyCloud_1 = require("../config/shorkyCloud");
 const autoHealFixture_1 = require("../fixtures/autoHealFixture");
 const gitContext_1 = require("../utils/gitContext");
+const preflight_1 = require("../cli/preflight");
 /**
  * Extracts the LLM token count `autoHealFixture.ts` attached to this test
  * result (see `SHORKY_TOKENS_ATTACHMENT_NAME`), if any. Attachments cross
@@ -68,6 +69,21 @@ class ShorkyCloudReporter {
             return;
         }
         try {
+            // Governance pre-check: ask shorky-cloud's tier-aware
+            // `/api/v1/governance/preflight` whether it will actually accept
+            // telemetry before paying the network round-trip to
+            // `/api/v1/telemetry`. A free-tier project that has hit its cloud
+            // storage quota gets `acceptsTelemetry: false` here — previously
+            // the CLI always POSTed the payload anyway and relied on
+            // `/api/v1/telemetry`'s own server-side drop behavior (still in
+            // place as a safety net), wasting the round-trip. `undefined`
+            // (check skipped/failed open, or Pro tier with no storage quota)
+            // is treated as "proceed" — only an explicit `false` skips the POST.
+            const preflight = await (0, preflight_1.runPreflightCheck)();
+            if (preflight.acceptsTelemetry === false) {
+                console.log(`ℹ️ [Shorky Cloud] Skipping telemetry transmission: ${preflight.message || 'free tier cloud storage quota reached.'}`);
+                return;
+            }
             console.log(`📤 [Shorky Cloud] Transmitting run artifacts to ${cloudUrl}...`);
             const passedCount = this.runData.passed;
             const failedCount = this.runData.failed;
@@ -77,7 +93,7 @@ class ShorkyCloudReporter {
             // autoHealFixture.ts). Reported both per-test and as a run-level
             // total below; shorky-cloud's /api/v1/telemetry uses the run-level
             // total when present, atomically incrementing that project's
-            // tokensUsedThisMonth for the /api/v1/preflight budget guard.
+            // tokensUsedThisMonth for the /api/v1/governance/preflight budget guard.
             const totalTokensUsed = this.testItems.reduce((sum, item) => sum + item.tokensUsed, 0);
             // Standardized repo identity (GITHUB_REPOSITORY -> local .git/config
             // -> "local/unknown") — see gitContext.ts. Split into repoOwner/repoName

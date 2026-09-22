@@ -1,6 +1,6 @@
 // src/cli/__tests__/preflight.test.ts
 //
-// Unit/mock tests for the pre-flight budget guard (src/cli/preflight.ts).
+// Unit/mock tests for the pre-flight governance guard (src/cli/preflight.ts).
 // Run via Node's built-in test runner (no extra dependencies):
 //   npm test        (node --import tsx --test "src/**/__tests__/**/*.test.ts")
 //   npm run test:watch
@@ -17,7 +17,7 @@ import assert from 'node:assert/strict';
 // otherwise reuse a stale `src/config/shorkyCloud.ts` import — in practice
 // that module has no top-level state, but importing after env setup keeps
 // the test's intent explicit and avoids any future caching foot-gun.
-import { runPreflightCheck } from '../preflight';
+import { formatStorageBanner, runPreflightCheck } from '../preflight';
 
 type FetchArgs = [input: string | URL | Request, init?: RequestInit];
 
@@ -50,7 +50,13 @@ afterEach(() => {
 
 test('runPreflightCheck: returns ok=true on 200 OK and calls fetch with the correct request', async () => {
   const fetchMock = mock.method(globalThis, 'fetch', async (...args: FetchArgs) => {
-    return jsonResponse(200, { success: true, tokensUsed: 100, monthlyTokenLimit: 1_000_000 });
+    return jsonResponse(200, {
+      success: true,
+      tier: 'free',
+      allowExecution: true,
+      acceptsTelemetry: true,
+      storage: { eventsStored: 100, storageQuota: 10_000 },
+    });
   });
 
   const result = await runPreflightCheck();
@@ -61,13 +67,18 @@ test('runPreflightCheck: returns ok=true on 200 OK and calls fetch with the corr
   assert.equal(fetchMock.mock.calls.length, 1);
 
   const [url, init] = fetchMock.mock.calls[0].arguments as FetchArgs;
-  assert.equal(url, 'http://localhost:3000/api/v1/preflight');
+  assert.equal(url, 'http://localhost:3000/api/v1/governance/preflight');
   assert.equal(init?.method, 'POST');
   assert.equal((init?.headers as Record<string, string>)['x-shorky-api-key'], 'test-api-key');
   assert.equal((init?.headers as Record<string, string>)['Content-Type'], 'application/json');
 });
 
-test('runPreflightCheck: returns ok=false with message on 402 Payment Required (subscription inactive)', async () => {
+// --- Legacy 402/429 fallback (defensive only) ---------------------------
+// The governance route itself always returns 200, but preflight.ts still
+// honors a hard 402/429 status defensively (e.g. if SHORKY_CLOUD_URL is
+// manually pointed at the legacy `/api/v1/preflight` route instead).
+
+test('runPreflightCheck: returns ok=false with message on 402 Payment Required (legacy fallback)', async () => {
   mock.method(globalThis, 'fetch', async () =>
     jsonResponse(402, {
       success: false,
@@ -94,7 +105,7 @@ test('runPreflightCheck: falls back to a default message on 402 when the respons
   assert.equal(result.message, 'Organization subscription is not active.');
 });
 
-test('runPreflightCheck: returns ok=false with message on 429 Too Many Requests (token budget exceeded)', async () => {
+test('runPreflightCheck: returns ok=false with message on 429 Too Many Requests (legacy fallback)', async () => {
   mock.method(globalThis, 'fetch', async () =>
     jsonResponse(429, {
       success: false,
@@ -125,7 +136,8 @@ test('runPreflightCheck: falls back to a default message on 429 when the respons
 // --- Fail-open scenarios ---------------------------------------------
 // A transient/unexpected cloud-side problem (timeout, connection refused,
 // unrelated 5xx) must NEVER block the CI job on its own — only an explicit
-// 402/429 response is a hard stop. See preflight.ts's module doc comment.
+// 402/429 response, or a 200 body with allowExecution: false, is a hard
+// stop. See preflight.ts's module doc comment.
 
 test('runPreflightCheck: fails OPEN (ok=true) on a simulated request timeout', async () => {
   mock.method(globalThis, 'fetch', async () => {
@@ -191,9 +203,9 @@ test('runPreflightCheck: returns ok=false and the correct message on HTTP 200 wi
       success: false,
       tier: 'pro',
       allowExecution: false,
+      acceptsTelemetry: true,
       message: 'Budget guardrail reached (1000000/1000000 tokens used this billing period).',
-      tokensUsed: 1_000_000,
-      monthlyTokenLimit: 1_000_000,
+      budget: { tokensUsed: 1_000_000, monthlyTokenLimit: 1_000_000 },
     }),
   );
 
@@ -202,7 +214,10 @@ test('runPreflightCheck: returns ok=false and the correct message on HTTP 200 wi
   assert.equal(result.ok, false);
   assert.equal(result.skipped, false);
   assert.equal(result.status, 200);
-  assert.equal(result.message, 'Monthly token budget exceeded. Healing aborted.');
+  assert.equal(result.tier, 'pro');
+  assert.equal(result.acceptsTelemetry, true);
+  assert.equal(result.message, 'Budget guardrail reached (1000000/1000000 tokens used this billing period).');
+  assert.deepEqual(result.budget, { tokensUsed: 1_000_000, monthlyTokenLimit: 1_000_000 });
 });
 
 test('runPreflightCheck: returns ok=true on HTTP 200 with allowExecution: true (Free tier — never blocked)', async () => {
@@ -211,8 +226,8 @@ test('runPreflightCheck: returns ok=true on HTTP 200 with allowExecution: true (
       success: true,
       tier: 'free',
       allowExecution: true,
-      tokensUsed: 0,
-      monthlyTokenLimit: 1_000_000,
+      acceptsTelemetry: true,
+      storage: { eventsStored: 500, storageQuota: 10_000 },
     }),
   );
 
@@ -221,6 +236,32 @@ test('runPreflightCheck: returns ok=true on HTTP 200 with allowExecution: true (
   assert.equal(result.ok, true);
   assert.equal(result.skipped, false);
   assert.equal(result.status, 200);
+  assert.equal(result.tier, 'free');
+  assert.equal(result.acceptsTelemetry, true);
+  assert.deepEqual(result.storage, { eventsStored: 500, storageQuota: 10_000 });
+});
+
+test('runPreflightCheck: returns ok=true with acceptsTelemetry=false when a free-tier project has exhausted its storage quota', async () => {
+  mock.method(globalThis, 'fetch', async () =>
+    jsonResponse(200, {
+      success: true,
+      tier: 'free',
+      allowExecution: true,
+      acceptsTelemetry: false,
+      message: 'Free tier cloud storage quota reached (10000/10000 recorded events).',
+      storage: { eventsStored: 10_000, storageQuota: 10_000 },
+    }),
+  );
+
+  const result = await runPreflightCheck();
+
+  // allowExecution is always true for free tier — the CLI's LLM loop is
+  // never blocked, only telemetry storage is gated.
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, false);
+  assert.equal(result.tier, 'free');
+  assert.equal(result.acceptsTelemetry, false);
+  assert.deepEqual(result.storage, { eventsStored: 10_000, storageQuota: 10_000 });
 });
 
 // --- Skip-path scenarios -----------------------------------------------
@@ -246,4 +287,33 @@ test('runPreflightCheck: skips entirely when Shorky Cloud is not enabled (no SHO
   assert.equal(result.ok, true);
   assert.equal(result.skipped, true);
   assert.equal(fetchMock.mock.calls.length, 0);
+});
+
+// --- formatStorageBanner() ----------------------------------------------
+// Pure formatting helper consumed by src/cli/index.ts's CLI banner and
+// handleHealOnFailure() to surface free-tier telemetry storage-quota
+// warnings (e.g. "⚠️ 8,200/10,000 free telemetry events used").
+
+test('formatStorageBanner: returns undefined when storage is undefined (Pro tier / skipped / failed open)', () => {
+  assert.equal(formatStorageBanner(undefined), undefined);
+});
+
+test('formatStorageBanner: returns undefined when usage is comfortably below the warning threshold', () => {
+  assert.equal(formatStorageBanner({ eventsStored: 100, storageQuota: 10_000 }), undefined);
+});
+
+test('formatStorageBanner: returns a soft "used" warning at/above the default 80% threshold', () => {
+  const banner = formatStorageBanner({ eventsStored: 8_200, storageQuota: 10_000 });
+  assert.match(banner ?? '', /8,200\/10,000 free telemetry events used/);
+});
+
+test('formatStorageBanner: returns a hard "quota reached" warning once usage reaches 100%', () => {
+  const banner = formatStorageBanner({ eventsStored: 10_000, storageQuota: 10_000 });
+  assert.match(banner ?? '', /quota reached/i);
+  assert.match(banner ?? '', /10,000\/10,000/);
+});
+
+test('formatStorageBanner: honors a custom warnAtRatio', () => {
+  assert.equal(formatStorageBanner({ eventsStored: 4_000, storageQuota: 10_000 }, 0.5), undefined);
+  assert.match(formatStorageBanner({ eventsStored: 5_000, storageQuota: 10_000 }, 0.5) ?? '', /5,000\/10,000/);
 });
