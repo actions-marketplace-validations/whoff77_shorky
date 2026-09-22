@@ -13,7 +13,7 @@ const codeFixer_1 = require("../engine/codeFixer");
 const shorkyCloud_1 = require("../config/shorkyCloud");
 const preflight_1 = require("./preflight");
 const githubPr_1 = require("../utils/githubPr");
-const generator_1 = require("../agent/generator");
+const specWriter_1 = require("../utils/specWriter");
 const gitContext_1 = require("../utils/gitContext");
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
@@ -511,7 +511,7 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
     console.log(`📝 Explanation: ${fixResult.explanation}`);
     console.log(`\n--- Code Diff Preview ---`);
     console.log(fixResult.fixedCode);
-    const overwriteResult = (0, generator_1.overwriteSpecInPlace)({
+    const overwriteResult = (0, specWriter_1.overwriteSpecInPlace)({
         specPath: absoluteSpecPath,
         rawFixedCode: fixResult.fixedCode,
     });

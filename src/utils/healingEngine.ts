@@ -27,33 +27,6 @@ function getOpenAIClient(): OpenAI {
   return cachedClient;
 }
 
-export async function healSelector(page: Page, failedSelector: string): Promise<string> {
-  const domSnapshot = await page.evaluate(() => {
-    return document.body.innerHTML.slice(0, 4000);
-  });
-
-  const response = await getOpenAIClient().chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      {
-        role: 'user',
-        content: `A Playwright test failed clicking selector: "${failedSelector}".
-Here is the raw HTML snapshot of the page:
-\`\`\`html
-${domSnapshot}
-\`\`\`
-Return ONLY the best valid CSS selector to click the intended element (e.g. button[type="submit"]). Do not include any explanation, quotes, or markdown code fences.`,
-      },
-    ],
-    temperature: 0,
-  });
-
-  recordTokenUsage(response.usage);
-
-  const healedSelector = response.choices[0]?.message?.content?.trim() || 'button[type="submit"]';
-  return healedSelector;
-}
-
 export async function assertVisual(
   page: Page,
   expectationPrompt: string

@@ -6,7 +6,7 @@ import { generateSpecFix, FixResult } from '../engine/codeFixer';
 import { getShorkyCloudApiKey, getShorkyCloudWebhookUrl, logDashboardCallToAction } from '../config/shorkyCloud';
 import { runPreflightCheck } from './preflight';
 import { HealedFixEntry, openHealingPullRequest, pushConsolidatedHealingBranch, stageHealingFix } from '../utils/githubPr';
-import { overwriteSpecInPlace } from '../agent/generator';
+import { overwriteSpecInPlace } from '../utils/specWriter';
 import { resolveRepositoryName } from '../utils/gitContext';
 
 import dotenv from 'dotenv';
