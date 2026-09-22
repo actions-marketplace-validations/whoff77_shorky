@@ -302,16 +302,12 @@ export async function executeAgentTool(
       }
 
       case 'clickElement': {
-        if (autoHealPage && autoHealPage.clickAndHeal) {
-          await autoHealPage.clickAndHeal(args.selector);
-        } else {
-          try {
-            await page.click(args.selector, { timeout: 3000 });
-          } catch (primaryError) {
-            console.warn(`⚠️ [Interceptor] clickElement selector failed: "${args.selector}". Initiating fallback engine...`);
-            const locator = await resolveWithFallback(page, args.selector, 'click', traceLogs);
-            await locator.click();
-          }
+        try {
+          await page.click(args.selector, { timeout: 3000 });
+        } catch (primaryError) {
+          console.warn(`⚠️ [Interceptor] clickElement selector failed: "${args.selector}". Initiating fallback engine...`);
+          const locator = await resolveWithFallback(page, args.selector, 'click', traceLogs);
+          await locator.click();
         }
         const observation = `Successfully clicked element matching selector "${args.selector}".`;
         pushTrace(traceLogs, { type: 'observation', tool: toolName, detail: observation });

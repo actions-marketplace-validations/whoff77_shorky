@@ -40,10 +40,10 @@ Key Requirements:
 1. Import test and expect from '../src/fixtures/autoHealFixture'.
 2. Use the 'autoHealPage' fixture like this:
    test('description', async ({ autoHealPage }) => {
-     const { page, clickAndHeal, assertVisual } = autoHealPage;
+     const { page, assertVisual } = autoHealPage;
      await page.goto(url);
      await page.fill(selector, value);
-     await clickAndHeal(selector);
+     await page.click(selector);
      await assertVisual(prompt);
    });
 3. Return ONLY executable TypeScript code inside a single block. Do not include markdown code fences or conversational text.`

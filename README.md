@@ -1,75 +1,75 @@
 # Shorky
 
 > **Autonomous Agentic SDET Framework**<br>
-> Bridging ReAct-based AI exploration with deterministic, high-integrity Playwright CI suites.
-
----
+> Deterministic, high-integrity Playwright CI suites with AI-powered self-healing.
 
 ## Overview
 
-Shorky is an agentic test automation framework designed to solve the two biggest challenges in modern AI testing: flakiness and high LLM runtime costs in CI/CD.
+Flaky tests and broken selectors are the biggest sources of CI noise and wasted engineering time. Traditional AI testing tools try to solve this by intercepting clicks at runtime, which hides the real bug and introduces massive LLM latency into every test run.
 
-Instead of running expensive, unpredictable LLM reasoning loops on every single pull request, Shorky uses a two-phase architecture:
+**Shorky completely rejects runtime healing.** 
 
-1. Exploratory Phase (Record): An autonomous ReAct agent dynamically navigates web applications, inspects live DOM trees, interacts with elements, and verifies goals using natural language.
-2. Deterministic Phase (Replay): Shorky's Code Synthesis Engine compiles execution traces into clean, static TypeScript Playwright specs. Subsequent CI runs execute at native browser speeds with zero live LLM API overhead.
+Instead, Shorky uses a **"Fail-and-Rewrite"** architecture. Your tests execute at native browser speeds with zero LLM API overhead. When a test fails in CI, Shorky kicks in *after* the run: it parses the Playwright trace, uses an LLM to diagnose the failure using the DOM snapshot, **permanently rewrites the underlying `.spec.ts` source code**, and opens a single consolidated pull request for a human to review.
+
+The core self-healing engine is **BYOK (Bring Your Own OpenAI Key) and open-source**.
 
 ---
 
-## Architecture
-```
-[ NATURAL LANGUAGE GOAL ]
+## The Shorky Ecosystem
+
+Shorky is designed as a three-part ecosystem, separating the core open-source engine from the optional, monetized governance and observability layer.
+
+1. **`shorky` (The Core Engine):** This repository. Shipped as a local CLI and a composite GitHub Action. It processes failed Playwright JSON reports, orchestrates the LLM code-fixes, overwrites local files, and handles GitHub PR creation. 
+2. **`shorky-cloud` (The SaaS):** The hosted telemetry and governance dashboard. It provides a per-project API key to track run history, self-healing trace timelines, and LLM token spend. For paying "Pro" tier users, it enforces a monthly token budget guardrail to prevent runaway LLM costs in CI.
+3. **`shorky-test-consumer` (The Proving Ground):** A live sample repository configured with intentionally broken specs to validate the end-to-end GitHub Action batching loop and Cloud governance gates.
+
+---
+
+## Architecture Flow
+
+```text
+[ Standard Playwright CI Run ]
            │
            ▼
 ┌─────────────────────────────┐
-│    Shorky ReAct Agent       │
-│    (OpenAI Tool Calling)    │
+│  Test Fails (Timeout/DOM)   │
+│  Generates JSON + trace.zip │
 └──────────┬──────────────────┘
            │
            ▼
 ┌─────────────────────────────┐
-│   Auto-Healing Fixture &    │
-│    Visual Regression        │
+│  Shorky CLI (fixTrace.ts)   │
+│  Extracts DOM / Error Log   │
+└──────────┬──────────────────┘
+           │ (Pre-flight budget check via Shorky Cloud)
+           ▼
+┌─────────────────────────────┐
+│ OpenAI LLM (codeFixer.ts)   │
+│ Identifies correct selector │
 └──────────┬──────────────────┘
            │
            ▼
 ┌─────────────────────────────┐
-│    Code Synthesis Engine    │
-│       (generator.ts)        │
+│  Shorky Overwrites Source   │
+│  (*.spec.ts patched locally)│
 └──────────┬──────────────────┘
            │
            ▼
 ┌─────────────────────────────┐
-│   Static Playwright Spec    │
-│   (*.generated.spec.ts)     │
-└──────────┬──────────────────┘
-           │
-           ▼
-┌─────────────────────────────┐
-│  Deterministic CI Pipeline  │
-│   (Zero-LLM Latency / $0)   │
+│ Shorky Opens GitHub PR      │
+│ (One batched PR per CI run) │
 └─────────────────────────────┘
 ```
+
 ---
 
 ## Key Features
 
-* Autonomous ReAct Agent Loop: Dynamically plans, reasons, and calls structured browser tools (navigate, inspectDOM, fillInput, clickElement, evaluateState).
-* Code Synthesis (generator.ts): Converts non-deterministic AI agent traces into permanent, clean Playwright TypeScript test files.
-* Self-Healing DOM Fixtures: Resilient element interceptors dynamically catch selector changes on the fly to reduce test flakiness.
-* Visual Regression Baselines: Cross-platform snapshot comparisons powered by pixelmatch with semantic vision assertion fallbacks.
-* CI/CD Optimized: High execution speed for regular regression suites by decoupling test generation from test execution.
-* Pre-Flight Budget Guard: Before starting any LLM-driven self-healing repair loop, Shorky checks in with `shorky-cloud` (`/api/v1/preflight`) to confirm the org's subscription is active and its monthly token budget hasn't been exceeded — aborting gracefully (and failing the CI job normally) with a `402`/`429` instead of racking up unbounded LLM spend.
-
----
-
-## Tech Stack
-
-* Core Runtime: TypeScript, Node.js
-* Automation Engine: Playwright
-* AI / Agentic Logic: OpenAI API (Structured Tool / Function Calling)
-* Visual Engine: Pixelmatch
-* Config & Environment: Dotenv
+* **Fail-and-Rewrite Engine:** Fixes the actual source code instead of masking failures at runtime.
+* **Batch PR Generation:** Aggregates all AI fixes from a single CI run into exactly *one* consolidated pull request.
+* **Zero CI Latency:** Tests run normally. The LLM is only invoked if a test actually fails.
+* **Pre-Flight Budget Guard:** Before starting any LLM repair loop, Shorky queries `shorky-cloud` to confirm the organization's monthly token budget hasn't been exceeded, gracefully aborting with a `402`/`429` to prevent unbounded OpenAI spend.
+* **Visual Regression Fallbacks:** Handles pixelmatch diffs safely by flagging them for human review rather than hallucinating code changes for intentional UI updates.
 
 ---
 
@@ -79,71 +79,49 @@ Instead of running expensive, unpredictable LLM reasoning loops on every single 
 
 * Node.js v18+
 * An OpenAI API Key (`OPENAI_API_KEY`)
-* **GitHub Repository Settings (for Auto-Healing PRs):** If running Shorky as a GitHub Action to automatically open fix pull requests, navigate to your repository **Settings > Actions > General > Workflow permissions** and ensure **"Allow GitHub Actions to create and approve pull requests"** is checked.
+* **GitHub Repository Settings:** If running Shorky as a GitHub Action, navigate to your repository **Settings > Actions > General > Workflow permissions** and ensure **"Allow GitHub Actions to create and approve pull requests"** is checked.
 
-### Installation
+### Usage in CI (GitHub Actions)
 
-1. Clone the repository:
-   git clone https://github.com/whoff77/shorky.git
-   cd shorky
-2. Install dependencies:
-   npm install
-3. Install Playwright browsers:
-   npx playwright install --with-deps
-4. Configure environment variables:
-   Create a .env file in the root directory:
-   OPENAI_API_KEY="sk-proj-your-openai-api-key"
+Add the Shorky action to your Playwright workflow directly after your test step. It will automatically detect failures, heal the code, and open a PR.
 
----
-
-## Running Shorky
-
-### 1. Run the Autonomous Agent (Record Phase)
-
-* Execute the agentic test suite to let Shorky explore the target workflow and output a static spec:
-
-* npx playwright test tests/agent-login.spec.ts --project="Google Chrome"
-
-### 2. Execute the Generated Spec (Replay Phase in CI)
-
-* Run the autogenerated Playwright test directly without LLM API calls:
-
-* npx playwright test tests/generated-login.spec.ts --project="Google Chrome"
-
----
-
-## Example Consumer Repository
-
-If you want to see a fully configured, working setup in action, check out the live example sandbox repository:
-* **Repository:** [whoff77/shorky-test-consumer](https://github.com/whoff77/shorky-test-consumer)
-* **What it includes:** A minimal Playwright + TypeScript project configured with an intentionally failing login test, the required GitHub Actions workflow, and pinned action references to validate the end-to-end auto-healing loop.
-
----
-
-## Repository Structure
-
+```yaml
+      - name: Run Playwright Tests
+        run: npx playwright test
+        
+      - name: Run Shorky Auto-Healer
+        if: failure()
+        uses: whoff77/shorky@v1.3.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          shorky-cloud-api-key: ${{ secrets.SHORKY_CLOUD_API_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          report-path: "test-results/report.json"
 ```
-shorky/
-├── src/
-│   ├── agent/
-│   │   ├── agentRunner.ts     # ReAct execution loop & tool definitions
-│   │   ├── generator.ts       # Code synthesis engine (Trace -> Spec)
-│   │   └── tools.ts           # Browser action tool definitions
-│   ├── cli/
-│   │   ├── index.ts            # `shorky run` CLI entrypoint
-│   │   ├── preflight.ts        # Pre-flight subscription/budget guard (calls shorky-cloud)
-│   │   └── fixTrace.ts         # GitHub Action auto-heal fixer logic
-│   ├── fixtures/
-│   │   └── autoHealFixture.ts # Resilient, self-healing Playwright fixture
-│   └── utils/
-│       ├── visual-diff.ts     # Cross-platform pixelmatch baseline runner
-│       └── githubPr.ts        # Automated PR creation and branch management
-├── tests/
-│   ├── agent-login.spec.ts    # Agent goal invocation
-│   └── generated-login.spec.ts # Autogenerated static Playwright test
-├── playwright.config.ts       # Playwright global configuration
-└── package.json
+
+### Usage Locally (CLI)
+
+You can run Shorky manually against a broken trace file on your local machine:
+
+```bash
+# 1. Run your test and let it fail to generate a trace
+npx playwright test tests/broken-login.spec.ts
+
+# 2. Point Shorky at the generated trace and tell it which file to patch
+npx tsx src/cli/fixTrace.ts \
+  --trace test-results/broken-login/trace.zip \
+  --spec tests/broken-login.spec.ts
 ```
+
+---
+
+## Tech Stack
+
+* **Core Runtime:** TypeScript, Node.js
+* **Automation Engine:** Playwright
+* **AI Engine:** OpenAI API (Structured Tool / Function Calling)
+* **Telemetry & SaaS:** Next.js, NextAuth v5, Neon (Postgres), Stripe
+
 ---
 
 ## License
