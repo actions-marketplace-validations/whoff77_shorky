@@ -1,9 +1,9 @@
 // src/utils/tokenUsage.ts
 //
 // Lightweight per-process accumulator for LLM tokens consumed by
-// self-healing / vision assertions during the *currently executing* test
-// (see `healingEngine.ts` and `agentRunner.ts`, which call `recordTokenUsage()`
-// after every OpenAI chat-completion response).
+// vision assertions during the *currently executing* test (see
+// `healingEngine.ts`, which calls `recordTokenUsage()` after every OpenAI
+// chat-completion response).
 //
 // WHY A MODULE-LEVEL COUNTER: Playwright runs each test's fixtures/body
 // inside a worker process that is *separate* from the main process running

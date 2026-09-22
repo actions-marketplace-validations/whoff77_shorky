@@ -36,7 +36,6 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.healSelector = healSelector;
 exports.assertVisual = assertVisual;
 const openai_1 = __importDefault(require("openai"));
 const dotenv = __importStar(require("dotenv"));
@@ -57,29 +56,6 @@ function getOpenAIClient() {
     }
     cachedClient = new openai_1.default({ apiKey });
     return cachedClient;
-}
-async function healSelector(page, failedSelector) {
-    const domSnapshot = await page.evaluate(() => {
-        return document.body.innerHTML.slice(0, 4000);
-    });
-    const response = await getOpenAIClient().chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-            {
-                role: 'user',
-                content: `A Playwright test failed clicking selector: "${failedSelector}".
-Here is the raw HTML snapshot of the page:
-\`\`\`html
-${domSnapshot}
-\`\`\`
-Return ONLY the best valid CSS selector to click the intended element (e.g. button[type="submit"]). Do not include any explanation, quotes, or markdown code fences.`,
-            },
-        ],
-        temperature: 0,
-    });
-    (0, tokenUsage_1.recordTokenUsage)(response.usage);
-    const healedSelector = response.choices[0]?.message?.content?.trim() || 'button[type="submit"]';
-    return healedSelector;
 }
 async function assertVisual(page, expectationPrompt) {
     // Take screenshot buffer as base64

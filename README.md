@@ -91,7 +91,7 @@ Add the Shorky action to your Playwright workflow directly after your test step.
         
       - name: Run Shorky Auto-Healer
         if: failure()
-        uses: whoff77/shorky@v1.3.13
+        uses: whoff77/shorky@vX.Y.Z
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           shorky-cloud-api-key: ${{ secrets.SHORKY_CLOUD_API_KEY }}
