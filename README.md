@@ -41,7 +41,7 @@ Shorky is designed as a three-part ecosystem, separating the core open-source en
 │  Shorky CLI (fixTrace.ts)   │
 │  Extracts DOM / Error Log   │
 └──────────┬──────────────────┘
-           │ (Pre-flight budget check via Shorky Cloud)
+           │ (Pre-flight governance check via Shorky Cloud)
            ▼
 ┌─────────────────────────────┐
 │ OpenAI LLM (codeFixer.ts)   │
@@ -68,7 +68,7 @@ Shorky is designed as a three-part ecosystem, separating the core open-source en
 * **Fail-and-Rewrite Engine:** Fixes the actual source code instead of masking failures at runtime.
 * **Batch PR Generation:** Aggregates all AI fixes from a single CI run into exactly *one* consolidated pull request.
 * **Zero CI Latency:** Tests run normally. The LLM is only invoked if a test actually fails.
-* **Pre-Flight Budget Guard:** Before starting any LLM repair loop, Shorky queries `shorky-cloud` to confirm the organization's monthly token budget hasn't been exceeded, gracefully aborting with a `402`/`429` to prevent unbounded OpenAI spend.
+* **Pre-Flight Governance Guard:** Before starting any LLM repair loop, Shorky queries `shorky-cloud`'s tier-aware `/api/v1/governance/preflight` endpoint to confirm the organization's monthly token budget hasn't been exceeded, gracefully aborting (via `allowExecution: false`) to prevent unbounded OpenAI spend. The same check also reports free-tier cloud telemetry storage-quota usage, letting the CLI skip a wasted `/api/v1/telemetry` upload once quota is exhausted and surface a "⚠️ 8,200/10,000 free telemetry events used" warning in the run banner.
 * **Visual Regression Fallbacks:** Handles pixelmatch diffs safely by flagging them for human review rather than hallucinating code changes for intentional UI updates.
 
 ---

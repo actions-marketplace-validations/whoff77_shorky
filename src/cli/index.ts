@@ -3,7 +3,7 @@ import { Command } from 'commander';
 import { spawn } from 'child_process';
 import { findLatestTraceZip, extractSpecPathFromTrace } from '../engine/traceParser';
 import { runOfflineFix } from './fixTrace';
-import { runPreflightCheck } from './preflight';
+import { formatStorageBanner, runPreflightCheck } from './preflight';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -16,14 +16,24 @@ program
 
 /**
  * Prints a styled banner summarizing the active run configuration.
+ *
+ * Also runs a lightweight governance pre-check (`runPreflightCheck()`)
+ * purely to surface a free-tier cloud telemetry storage-quota warning
+ * (e.g. "⚠️ 8,200/10,000 free telemetry events used") up front, before
+ * Playwright even starts — independent of `--heal`/pass-fail outcome,
+ * since telemetry (`cloudReporter.ts`) is sent for every run regardless of
+ * whether self-healing triggers. This is purely informational: it never
+ * blocks the run (the actual `allowExecution` budget-guard enforcement
+ * still only happens in `handleHealOnFailure()`, right before an LLM call
+ * would be made).
  */
-function printBanner(options: {
+async function printBanner(options: {
   project: string;
   heal: boolean;
   vision: boolean;
   generateOnly: boolean;
   headed: boolean;
-}): void {
+}): Promise<void> {
   const heal = options.heal ? 'ON' : 'OFF';
   const vision = options.vision ? 'ON' : 'OFF';
   const headed = options.headed ? 'ON' : 'OFF';
@@ -43,6 +53,13 @@ function printBanner(options: {
     `🤖 [Shorky] Launching test run -> [${options.project}] ` +
       `[Self-Healing: ${heal}] [Vision: ${vision}] [Headed: ${headed}] [Generate-Only: ${generateOnly}]`
   );
+
+  const preflight = await runPreflightCheck();
+  const storageBanner = formatStorageBanner(preflight.storage);
+  if (storageBanner) {
+    console.log(storageBanner);
+  }
+
   console.log('———————————————————————————————————————————————————————————\n');
 }
 
@@ -52,12 +69,17 @@ function printBanner(options: {
  * against it. Used as a fallback when Playwright exits non-zero and
  * `--heal` is enabled.
  *
- * Before any LLM repair loop is started, `runOfflineFix()` (called below)
- * performs a pre-flight budget check against shorky-cloud's
- * `/api/v1/preflight` endpoint (see `src/cli/preflight.ts`). If the org's
- * subscription is inactive (402) or its monthly token budget is exceeded
- * (429), the fixer aborts immediately with a logged error and a non-zero
- * exit code — no OpenAI call is ever made, and the CI job fails normally.
+ * Before any LLM repair loop is started, this function (not
+ * `runOfflineFix()`, which is called with `skipPreflightCheck: true` since
+ * the check already happened here) performs a pre-flight governance check
+ * against shorky-cloud's always-200 `/api/v1/governance/preflight`
+ * endpoint (see `src/cli/preflight.ts`). If the response body's
+ * `allowExecution` is `false` (a Pro-tier project that has exhausted its
+ * monthly token budget), the fixer aborts immediately with a logged error
+ * and a non-zero exit code — no OpenAI call is ever made, and the CI job
+ * fails normally. The same check's `storage` figures (if present) are also
+ * re-logged here as a fresh confirmation of free-tier telemetry quota
+ * usage, in case it changed since `printBanner()`'s earlier check.
  */
 async function handleHealOnFailure(): Promise<void> {
   console.log('\n🩹 [Shorky] --heal enabled. Attempting automatic self-healing fix...');
@@ -77,12 +99,18 @@ async function handleHealOnFailure(): Promise<void> {
   console.log(`🔎 [Shorky] Found trace: ${tracePath}`);
   console.log(`🔎 [Shorky] Resolved failing spec: ${specPath}`);
 
-  // Pre-flight budget guard: run this BEFORE the LLM repair loop starts.
-  // If the org's subscription is inactive (402) or its monthly token
-  // budget is exceeded (429), abort the self-healing attempt immediately,
-  // log the reason, and fail the CI job normally (non-zero exit) rather
-  // than proceeding into an LLM call.
+  // Pre-flight governance guard: run this BEFORE the LLM repair loop
+  // starts. If `allowExecution` is false (Pro-tier monthly token budget
+  // exceeded), abort the self-healing attempt immediately, log the
+  // reason, and fail the CI job normally (non-zero exit) rather than
+  // proceeding into an LLM call.
   const preflight = await runPreflightCheck();
+
+  const storageBanner = formatStorageBanner(preflight.storage);
+  if (storageBanner) {
+    console.log(storageBanner);
+  }
+
   if (!preflight.ok) {
     console.error(`🛑 [Shorky] Aborting self-healing run: ${preflight.message}`);
     process.exit(1);
@@ -104,7 +132,7 @@ program
   .option('--vision', 'Enable AI vision-based DOM evaluation and audit checks', false)
   .option('--generate-only', 'Generate standard Playwright specs without persisting cloud telemetry', false)
   .option('--headed', 'Run browser instances in headed mode for visual debugging', false)
-  .action((testPattern: string | undefined, options: {
+  .action(async (testPattern: string | undefined, options: {
     project: string;
     heal: boolean;
     vision: boolean;
@@ -117,7 +145,7 @@ program
     process.env.SHORKY_GENERATE_ONLY = options.generateOnly ? 'true' : 'false';
     process.env.SHORKY_PROJECT_NAME = options.project;
 
-    printBanner(options);
+    await printBanner(options);
 
     const args: string[] = ['playwright', 'test'];
 

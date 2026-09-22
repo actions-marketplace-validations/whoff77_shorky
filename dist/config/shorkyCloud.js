@@ -15,7 +15,7 @@ exports.isShorkyCloudEnabled = isShorkyCloudEnabled;
 exports.getShorkyCloudApiKey = getShorkyCloudApiKey;
 exports.getShorkyCloudTelemetryUrl = getShorkyCloudTelemetryUrl;
 exports.getShorkyCloudWebhookUrl = getShorkyCloudWebhookUrl;
-exports.getShorkyCloudPreflightUrl = getShorkyCloudPreflightUrl;
+exports.getShorkyCloudGovernancePreflightUrl = getShorkyCloudGovernancePreflightUrl;
 /** Default endpoint used for local telemetry reporting (Playwright reporter). */
 exports.DEFAULT_SHORKY_CLOUD_TELEMETRY_URL = 'http://localhost:3000/api/v1/telemetry';
 /** Default base URL used for the hosted shorky-cloud webhook (CLI auto-fix flow). */
@@ -88,14 +88,22 @@ function getShorkyCloudWebhookUrl(defaultBaseUrl = exports.DEFAULT_SHORKY_CLOUD_
     return `${trimmedBase}/api/webhook`;
 }
 /**
- * Resolves the fully-qualified pre-flight budget-check endpoint
- * (`/api/v1/preflight`) that the CLI/action calls before starting any
- * LLM-driven repair loop (see `src/cli/preflight.ts`). Accepts the same
- * optional base-URL override pattern as `getShorkyCloudWebhookUrl` since
- * different call sites use different sensible fallbacks.
+ * Resolves the fully-qualified tier-aware governance pre-flight endpoint
+ * (`/api/v1/governance/preflight`) that the CLI/action calls before
+ * starting any LLM-driven repair loop (see `src/cli/preflight.ts`).
+ * Accepts the same optional base-URL override pattern as
+ * `getShorkyCloudWebhookUrl` since different call sites use different
+ * sensible fallbacks.
+ *
+ * Supersedes the legacy `/api/v1/preflight` route (kept server-side by
+ * shorky-cloud for backward compatibility only) now that `preflight.ts`
+ * has been migrated to consume the always-200
+ * `allowExecution`/`acceptsTelemetry` contract exposed by
+ * `/api/v1/governance/preflight` instead of the old hard 402/429 HTTP
+ * status contract.
  */
-function getShorkyCloudPreflightUrl(defaultBaseUrl = exports.DEFAULT_SHORKY_CLOUD_BASE_URL) {
+function getShorkyCloudGovernancePreflightUrl(defaultBaseUrl = exports.DEFAULT_SHORKY_CLOUD_BASE_URL) {
     const base = sanitizeCloudUrl(process.env.SHORKY_CLOUD_URL || defaultBaseUrl);
     const trimmedBase = base.replace(/\/api\/v1\/telemetry\/?$/, '').replace(/\/+$/, '');
-    return `${trimmedBase}/api/v1/preflight`;
+    return `${trimmedBase}/api/v1/governance/preflight`;
 }

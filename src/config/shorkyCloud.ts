@@ -92,14 +92,22 @@ export function getShorkyCloudWebhookUrl(defaultBaseUrl: string = DEFAULT_SHORKY
 }
 
 /**
- * Resolves the fully-qualified pre-flight budget-check endpoint
- * (`/api/v1/preflight`) that the CLI/action calls before starting any
- * LLM-driven repair loop (see `src/cli/preflight.ts`). Accepts the same
- * optional base-URL override pattern as `getShorkyCloudWebhookUrl` since
- * different call sites use different sensible fallbacks.
+ * Resolves the fully-qualified tier-aware governance pre-flight endpoint
+ * (`/api/v1/governance/preflight`) that the CLI/action calls before
+ * starting any LLM-driven repair loop (see `src/cli/preflight.ts`).
+ * Accepts the same optional base-URL override pattern as
+ * `getShorkyCloudWebhookUrl` since different call sites use different
+ * sensible fallbacks.
+ *
+ * Supersedes the legacy `/api/v1/preflight` route (kept server-side by
+ * shorky-cloud for backward compatibility only) now that `preflight.ts`
+ * has been migrated to consume the always-200
+ * `allowExecution`/`acceptsTelemetry` contract exposed by
+ * `/api/v1/governance/preflight` instead of the old hard 402/429 HTTP
+ * status contract.
  */
-export function getShorkyCloudPreflightUrl(defaultBaseUrl: string = DEFAULT_SHORKY_CLOUD_BASE_URL): string {
+export function getShorkyCloudGovernancePreflightUrl(defaultBaseUrl: string = DEFAULT_SHORKY_CLOUD_BASE_URL): string {
   const base = sanitizeCloudUrl(process.env.SHORKY_CLOUD_URL || defaultBaseUrl);
   const trimmedBase = base.replace(/\/api\/v1\/telemetry\/?$/, '').replace(/\/+$/, '');
-  return `${trimmedBase}/api/v1/preflight`;
+  return `${trimmedBase}/api/v1/governance/preflight`;
 }
