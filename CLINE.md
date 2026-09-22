@@ -19,6 +19,7 @@ The `shorky` CLI (`dist/cli/index.js`, source `src/cli/index.ts`) wraps `npx pla
 
 ## Core Development Rules
 - **Self-Documenting Changes:** Before finishing ANY task that adds/removes a feature, renames or deletes a file, changes a fixture/schema/API contract, bumps a cross-repo version pin, or otherwise changes behavior described below, you MUST update this `CLINE.md` to match — both adding what's new AND deleting/correcting whatever it said before that is now stale, wrong, or extraneous. A stale or contradictory `CLINE.md` costs more tokens on every future task than no doc at all (the agent has to re-discover the truth from source first), so treat pruning outdated content as equally mandatory as adding new content. Skip only genuinely trivial changes (typo fixes, formatting, comments) that don't change any behavior this file documents.
+- **Check the local README:** The `README.md` in this repository acts as the architectural source of truth. Before and after making any changes, ensure your logic does not conflict with the established business goals or ecosystem boundaries defined there. If your changes alter the architecture, update the local `README.md` and explicitly prompt the human developer to update the other repositories in the ecosystem to maintain cohesion.
 
 ## Tech Stack & Core Tools
 
