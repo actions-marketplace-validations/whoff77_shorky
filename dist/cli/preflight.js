@@ -94,7 +94,7 @@ async function runPreflightCheck() {
         console.log('ℹ️ [Shorky] SHORKY_CLOUD_API_KEY not configured. Skipping pre-flight governance check.');
         return { ok: true, skipped: true };
     }
-    const preflightUrl = (0, shorkyCloud_1.getShorkyCloudGovernancePreflightUrl)(process.env.SHORKY_CLOUD_URL);
+    const preflightUrl = (0, shorkyCloud_1.getShorkyCloudGovernancePreflightUrl)();
     try {
         console.log(`🚦 [Shorky] Running pre-flight governance check against ${preflightUrl}...`);
         const response = await fetch(preflightUrl, {

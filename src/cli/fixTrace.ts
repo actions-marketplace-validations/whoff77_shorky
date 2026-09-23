@@ -78,7 +78,7 @@ async function notifyShorkyCloud(
   // with — critical for tracing down split/duplicate Neon run IDs.
   console.log(`📤 [Diagnostic] shorky-cloud webhook payload for "${sanitizedSpecPath}":`, JSON.stringify(payload, null, 2));
 
-  const webhookUrl = getShorkyCloudWebhookUrl(process.env.SHORKY_CLOUD_URL);
+  const webhookUrl = getShorkyCloudWebhookUrl();
   try {
     const res = await fetch(webhookUrl, {
       method: 'POST',

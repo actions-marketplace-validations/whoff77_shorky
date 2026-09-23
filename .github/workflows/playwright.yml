@@ -12,7 +12,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     env:
-      SHORKY_CLOUD_URL: ${{ vars.SHORKY_CLOUD_URL || 'https://shorky-cloud.vercel.app/api/v1/telemetry' }}
+      SHORKY_CLOUD_URL: ${{ vars.SHORKY_CLOUD_URL || 'https://shorky-cloud.vercel.app' }}
       SHORKY_CLOUD_API_KEY: ${{ secrets.SHORKY_CLOUD_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 

@@ -52,7 +52,7 @@ function getOpenAIClient() {
     }
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-        throw new Error('OPENAI_API_KEY is missing. Provide OPENAI_API_KEY for local CLI mode, or configure SHORKY_CLOUD_URL and SHORKY_CLOUD_API_KEY for cloud mode.');
+        throw new Error('OPENAI_API_KEY is missing. Provide OPENAI_API_KEY for local CLI mode, or configure SHORKY_CLOUD_API_KEY (and optionally SHORKY_CLOUD_URL) for cloud mode.');
     }
     cachedClient = new openai_1.default({ apiKey });
     return cachedClient;
