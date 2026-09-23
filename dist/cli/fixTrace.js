@@ -70,7 +70,7 @@ async function notifyShorkyCloud(specPath, fixResult, traceZipPath, errorLog, ru
     // confirming which runId a given spec's telemetry was actually tagged
     // with — critical for tracing down split/duplicate Neon run IDs.
     console.log(`📤 [Diagnostic] shorky-cloud webhook payload for "${sanitizedSpecPath}":`, JSON.stringify(payload, null, 2));
-    const webhookUrl = (0, shorkyCloud_1.getShorkyCloudWebhookUrl)(process.env.SHORKY_CLOUD_URL);
+    const webhookUrl = (0, shorkyCloud_1.getShorkyCloudWebhookUrl)();
     try {
         const res = await fetch(webhookUrl, {
             method: 'POST',

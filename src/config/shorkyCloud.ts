@@ -5,12 +5,15 @@
  * (base URLs, endpoint construction, and API key resolution) so that the
  * various consumers (Playwright reporter, CLI trace fixer, config loader,
  * etc.) never hardcode or re-derive these values independently.
+ *
+ * `SHORKY_CLOUD_URL` is an OPTIONAL override, only needed for local
+ * tunneling/custom deployments (e.g. `http://localhost:3000`). Consumers
+ * only need to set `SHORKY_CLOUD_API_KEY` (plus `OPENAI_API_KEY`) to enable
+ * cloud telemetry and pre-flight governance against the hosted production
+ * shorky-cloud instance.
  */
 
-/** Default endpoint used for local telemetry reporting (Playwright reporter). */
-export const DEFAULT_SHORKY_CLOUD_TELEMETRY_URL = 'http://localhost:3000/api/v1/telemetry';
-
-/** Default base URL used for the hosted shorky-cloud webhook (CLI auto-fix flow). */
+/** Default (production) base origin used for every shorky-cloud endpoint. */
 export const DEFAULT_SHORKY_CLOUD_BASE_URL = 'https://shorky-cloud.vercel.app';
 
 /**
@@ -56,11 +59,52 @@ export function sanitizeCloudUrl(rawUrl: string): string {
 }
 
 /**
+ * Resolves the effective, normalized shorky-cloud base origin (scheme +
+ * host + port, no path/trailing slash). Defensively guards against
+ * legacy/misconfigured `SHORKY_CLOUD_URL` values that still include a
+ * subpath and/or trailing slash (e.g.
+ * `https://shorky-cloud.vercel.app/api/v1/telemetry/` or
+ * `http://localhost:3000/api/v1/telemetry`) — both normalize down to just
+ * the origin (`https://shorky-cloud.vercel.app` / `http://localhost:3000`).
+ *
+ * `SHORKY_CLOUD_URL` is an OPTIONAL override for local tunneling/custom
+ * deployments only; when unset (or blank/whitespace-only), or when the
+ * provided value fails to parse as a URL at all, this falls back to the
+ * production `DEFAULT_SHORKY_CLOUD_BASE_URL` rather than throwing — a
+ * malformed override should never hard-crash the CLI/reporter.
+ *
+ * @param overrideUrl Optional explicit override, taking precedence over
+ *   `process.env.SHORKY_CLOUD_URL` when provided (used by call sites that
+ *   accept their own override parameter, e.g. `getShorkyCloudWebhookUrl`).
+ */
+export function getShorkyCloudBaseUrl(overrideUrl?: string): string {
+  const raw = overrideUrl ?? process.env.SHORKY_CLOUD_URL;
+  if (!raw || !raw.trim()) {
+    return DEFAULT_SHORKY_CLOUD_BASE_URL;
+  }
+
+  const sanitized = sanitizeCloudUrl(raw);
+  if (!sanitized) {
+    return DEFAULT_SHORKY_CLOUD_BASE_URL;
+  }
+
+  try {
+    return new URL(sanitized).origin;
+  } catch {
+    // Malformed URL string (e.g. missing scheme) — fail safe to production
+    // rather than propagating an exception up into the CLI/reporter.
+    return DEFAULT_SHORKY_CLOUD_BASE_URL;
+  }
+}
+
+/**
  * Returns whether Shorky Cloud reporting/integration should be considered
- * enabled for the current process, based on env configuration.
+ * enabled for the current process. Enabled purely by the presence of
+ * `SHORKY_CLOUD_API_KEY` — `SHORKY_CLOUD_URL` is an optional override and
+ * must never be required to activate cloud features.
  */
 export function isShorkyCloudEnabled(): boolean {
-  return process.env.ENABLE_SHORKY_CLOUD === 'true' || !!process.env.SHORKY_CLOUD_URL;
+  return Boolean(process.env.SHORKY_CLOUD_API_KEY);
 }
 
 /**
@@ -76,28 +120,26 @@ export function getShorkyCloudApiKey(): string {
  * reporter to POST run summaries after each test run.
  */
 export function getShorkyCloudTelemetryUrl(): string {
-  return sanitizeCloudUrl(process.env.SHORKY_CLOUD_URL || DEFAULT_SHORKY_CLOUD_TELEMETRY_URL);
+  return `${getShorkyCloudBaseUrl()}/api/v1/telemetry`;
 }
 
 /**
  * Resolves the fully-qualified webhook endpoint (`/api/webhook`) used by
  * the CLI auto-fix flow to notify shorky-cloud of generated fixes or
- * dispatch failure telemetry. Accepts an optional override for the base
- * URL default, since different call sites use different sensible fallbacks.
+ * dispatch failure telemetry. Accepts an optional override URL (e.g. a
+ * caller-supplied `process.env.SHORKY_CLOUD_URL`), normalized down to its
+ * origin exactly like every other shorky-cloud endpoint resolver.
  */
-export function getShorkyCloudWebhookUrl(defaultBaseUrl: string = DEFAULT_SHORKY_CLOUD_BASE_URL): string {
-  const base = sanitizeCloudUrl(process.env.SHORKY_CLOUD_URL || defaultBaseUrl);
-  const trimmedBase = base.replace(/\/api\/v1\/telemetry\/?$/, '').replace(/\/+$/, '');
-  return `${trimmedBase}/api/webhook`;
+export function getShorkyCloudWebhookUrl(overrideUrl?: string): string {
+  return `${getShorkyCloudBaseUrl(overrideUrl)}/api/webhook`;
 }
 
 /**
  * Resolves the fully-qualified tier-aware governance pre-flight endpoint
  * (`/api/v1/governance/preflight`) that the CLI/action calls before
  * starting any LLM-driven repair loop (see `src/cli/preflight.ts`).
- * Accepts the same optional base-URL override pattern as
- * `getShorkyCloudWebhookUrl` since different call sites use different
- * sensible fallbacks.
+ * Accepts the same optional override-URL pattern as
+ * `getShorkyCloudWebhookUrl`.
  *
  * Supersedes the legacy `/api/v1/preflight` route (kept server-side by
  * shorky-cloud for backward compatibility only) now that `preflight.ts`
@@ -106,8 +148,6 @@ export function getShorkyCloudWebhookUrl(defaultBaseUrl: string = DEFAULT_SHORKY
  * `/api/v1/governance/preflight` instead of the old hard 402/429 HTTP
  * status contract.
  */
-export function getShorkyCloudGovernancePreflightUrl(defaultBaseUrl: string = DEFAULT_SHORKY_CLOUD_BASE_URL): string {
-  const base = sanitizeCloudUrl(process.env.SHORKY_CLOUD_URL || defaultBaseUrl);
-  const trimmedBase = base.replace(/\/api\/v1\/telemetry\/?$/, '').replace(/\/+$/, '');
-  return `${trimmedBase}/api/v1/governance/preflight`;
+export function getShorkyCloudGovernancePreflightUrl(overrideUrl?: string): string {
+  return `${getShorkyCloudBaseUrl(overrideUrl)}/api/v1/governance/preflight`;
 }

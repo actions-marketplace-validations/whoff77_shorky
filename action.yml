@@ -7,9 +7,9 @@ branding:
 
 inputs:
   shorky-cloud-url:
-    description: 'The URL of your shorky-cloud instance'
+    description: 'Advanced/optional: base URL of a self-hosted or tunneled shorky-cloud instance (e.g. for local dev). Defaults to the hosted production instance; most consumers should leave this unset and only configure shorky-cloud-api-key.'
     required: false
-    default: 'https://shorky-cloud.vercel.app/api/v1/telemetry'
+    default: 'https://shorky-cloud.vercel.app'
   shorky-cloud-api-key:
     description: 'API key for authenticating with shorky-cloud'
     required: false

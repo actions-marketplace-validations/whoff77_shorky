@@ -39,7 +39,13 @@ function jsonResponse(status: number, body: unknown): Response {
 
 beforeEach(() => {
   resetEnv();
-  process.env.SHORKY_CLOUD_URL = 'http://localhost:3000/api/v1/telemetry';
+  // SHORKY_CLOUD_URL is intentionally left unset here — it's an OPTIONAL
+  // override for local tunneling/custom deployments; SHORKY_CLOUD_API_KEY
+  // alone is sufficient to enable cloud features (see isShorkyCloudEnabled()
+  // in src/config/shorkyCloud.ts). Individual tests below set
+  // SHORKY_CLOUD_URL explicitly when exercising the override/normalization
+  // behavior.
+  delete process.env.SHORKY_CLOUD_URL;
   process.env.SHORKY_CLOUD_API_KEY = 'test-api-key';
 });
 
@@ -48,7 +54,7 @@ afterEach(() => {
   resetEnv();
 });
 
-test('runPreflightCheck: returns ok=true on 200 OK and calls fetch with the correct request', async () => {
+test('runPreflightCheck: defaults to the production shorky-cloud origin when SHORKY_CLOUD_URL is omitted, and calls fetch with the correct request', async () => {
   const fetchMock = mock.method(globalThis, 'fetch', async (...args: FetchArgs) => {
     return jsonResponse(200, {
       success: true,
@@ -67,10 +73,41 @@ test('runPreflightCheck: returns ok=true on 200 OK and calls fetch with the corr
   assert.equal(fetchMock.mock.calls.length, 1);
 
   const [url, init] = fetchMock.mock.calls[0].arguments as FetchArgs;
-  assert.equal(url, 'http://localhost:3000/api/v1/governance/preflight');
+  assert.equal(url, 'https://shorky-cloud.vercel.app/api/v1/governance/preflight');
   assert.equal(init?.method, 'POST');
   assert.equal((init?.headers as Record<string, string>)['x-shorky-api-key'], 'test-api-key');
   assert.equal((init?.headers as Record<string, string>)['Content-Type'], 'application/json');
+});
+
+// --- SHORKY_CLOUD_URL origin normalization (optional override) ----------
+// SHORKY_CLOUD_URL is an OPTIONAL override for local tunneling/custom
+// deployments. Whatever value is provided — including legacy/misconfigured
+// values still pointing at a subpath and/or with a trailing slash — must be
+// defensively normalized down to just its origin before the
+// `/api/v1/governance/preflight` suffix is appended.
+
+test('runPreflightCheck: strips a subpath from a SHORKY_CLOUD_URL override and routes to that origin\'s governance/preflight endpoint', async () => {
+  process.env.SHORKY_CLOUD_URL = 'http://localhost:3000/api/v1/telemetry';
+  const fetchMock = mock.method(globalThis, 'fetch', async () =>
+    jsonResponse(200, { success: true, tier: 'free', allowExecution: true, acceptsTelemetry: true }),
+  );
+
+  await runPreflightCheck();
+
+  const [url] = fetchMock.mock.calls[0].arguments as FetchArgs;
+  assert.equal(url, 'http://localhost:3000/api/v1/governance/preflight');
+});
+
+test('runPreflightCheck: strips a subpath and trailing slash from a production SHORKY_CLOUD_URL override', async () => {
+  process.env.SHORKY_CLOUD_URL = 'https://shorky-cloud.vercel.app/api/v1/telemetry/';
+  const fetchMock = mock.method(globalThis, 'fetch', async () =>
+    jsonResponse(200, { success: true, tier: 'free', allowExecution: true, acceptsTelemetry: true }),
+  );
+
+  await runPreflightCheck();
+
+  const [url] = fetchMock.mock.calls[0].arguments as FetchArgs;
+  assert.equal(url, 'https://shorky-cloud.vercel.app/api/v1/governance/preflight');
 });
 
 // --- Legacy 402/429 fallback (defensive only) ---------------------------
@@ -277,9 +314,9 @@ test('runPreflightCheck: skips entirely (ok=true, skipped=true) and never calls 
   assert.equal(fetchMock.mock.calls.length, 0);
 });
 
-test('runPreflightCheck: skips entirely when Shorky Cloud is not enabled (no SHORKY_CLOUD_URL, ENABLE_SHORKY_CLOUD unset)', async () => {
-  delete process.env.SHORKY_CLOUD_URL;
-  delete process.env.ENABLE_SHORKY_CLOUD;
+test('runPreflightCheck: cloud features remain disabled (skipped) when SHORKY_CLOUD_API_KEY is absent, even if SHORKY_CLOUD_URL is set', async () => {
+  delete process.env.SHORKY_CLOUD_API_KEY;
+  process.env.SHORKY_CLOUD_URL = 'https://shorky-cloud.vercel.app';
   const fetchMock = mock.method(globalThis, 'fetch', async () => jsonResponse(200, { success: true }));
 
   const result = await runPreflightCheck();

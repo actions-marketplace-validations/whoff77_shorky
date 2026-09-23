@@ -86,7 +86,7 @@ export default class ShorkyCloudReporter implements Reporter {
 
     // Skip attempting transmission entirely if cloud is explicitly disabled
     if (!isShorkyCloudEnabled()) {
-      console.log('ℹ️ [Shorky Cloud] Telemetry transmission skipped (SHORKY_CLOUD_URL not configured).');
+      console.log('ℹ️ [Shorky Cloud] Telemetry transmission skipped (SHORKY_CLOUD_API_KEY not configured).');
       return;
     }
 

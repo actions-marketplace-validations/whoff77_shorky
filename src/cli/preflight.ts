@@ -140,7 +140,7 @@ export async function runPreflightCheck(): Promise<PreflightResult> {
     return { ok: true, skipped: true };
   }
 
-  const preflightUrl = getShorkyCloudGovernancePreflightUrl(process.env.SHORKY_CLOUD_URL);
+  const preflightUrl = getShorkyCloudGovernancePreflightUrl();
 
   try {
     console.log(`🚦 [Shorky] Running pre-flight governance check against ${preflightUrl}...`);

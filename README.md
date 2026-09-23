@@ -79,6 +79,7 @@ Shorky is designed as a three-part ecosystem, separating the core open-source en
 
 * Node.js v18+
 * An OpenAI API Key (`OPENAI_API_KEY`)
+* (Optional) A `shorky-cloud` API key (`SHORKY_CLOUD_API_KEY`) to enable telemetry, dashboard run history, and the pre-flight governance/budget guard. That's the only secret needed to opt into cloud features — Shorky talks to the hosted production instance (`https://shorky-cloud.vercel.app`) by default.
 * **GitHub Repository Settings:** If running Shorky as a GitHub Action, navigate to your repository **Settings > Actions > General > Workflow permissions** and ensure **"Allow GitHub Actions to create and approve pull requests"** is checked.
 
 ### Usage in CI (GitHub Actions)
@@ -112,6 +113,10 @@ npx tsx src/cli/fixTrace.ts \
   --trace test-results/broken-login/trace.zip \
   --spec tests/broken-login.spec.ts
 ```
+
+### Advanced: Self-Hosting / Local Tunnel
+
+`SHORKY_CLOUD_URL` is an **optional** environment variable, only needed if you're running your own `shorky-cloud` instance locally or via a tunnel (e.g. `http://localhost:3000` or an `ngrok` URL). It defaults to the hosted production origin (`https://shorky-cloud.vercel.app`) and does not need a path — Shorky normalizes whatever value it's given down to just the base origin before constructing each endpoint. Most consumer repos never need to set this.
 
 ---
 
