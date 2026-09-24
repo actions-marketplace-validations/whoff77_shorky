@@ -61,6 +61,27 @@ export type OpenHealingPrOptions = HealedFixEntry;
 export const HEALING_BRANCH_NAME = 'shorky/auto-heal-fixes';
 
 /**
+ * Tracks spec paths already `git add`/`git commit`-ed by `stageHealingFix()`
+ * within this process, so that a spec file with multiple healed tests
+ * (each producing its own `HealedFixEntry` — see `fixTrace.ts`'s
+ * `additionalFailingTests` aggregation) is only ever staged/committed ONCE.
+ * Without this guard, the second+ entry for the same file would either
+ * `git commit` a no-op (nothing changed since the first commit already
+ * captured the write) and fail with a non-zero exit, or — worse — silently
+ * create confusing duplicate commits for a single file change.
+ */
+const stagedSpecPaths = new Set<string>();
+
+/**
+ * Test-only helper: clears the `stagedSpecPaths` dedup guard between test
+ * cases, since it is process/module-level state that would otherwise leak
+ * across unrelated `stageHealingFix()` calls in the same test run.
+ */
+export function __resetStagedSpecPathsForTests(): void {
+  stagedSpecPaths.clear();
+}
+
+/**
  * Resolves the "owner/repo" slug that the GitHub REST API expects, from the
  * standard GITHUB_REPOSITORY env var GitHub Actions always sets.
  */
@@ -123,19 +144,47 @@ async function findExistingOpenPr(
 }
 
 /** Builds the aggregated PR body describing every healed fix in this run. */
-function buildPrBody(fixes: HealedFixEntry[], repoRoot: string): string {
+export function buildPrBody(fixes: HealedFixEntry[], repoRoot: string): string {
   const toRelative = (specPath: string) =>
     path.isAbsolute(specPath) ? path.relative(repoRoot, specPath) : specPath;
 
   const codeFixes = fixes.filter((fix) => !fix.isVisualRegression);
   const visualFixes = fixes.filter((fix) => fix.isVisualRegression);
 
-  const codeSections = codeFixes.map((fix) => {
+  // Group code fixes by specPath: a single file can now have multiple
+  // HealedFixEntry records — one per originally-failing test (see
+  // fixTrace.ts's `additionalFailingTests` aggregation) — but they all
+  // share the SAME generated fixedCode/explanation for that one file. List
+  // each healed test as its own sub-bullet under a single file heading
+  // instead of rendering a duplicate/near-duplicate section per test.
+  const codeFixesBySpec = new Map<string, HealedFixEntry[]>();
+  for (const fix of codeFixes) {
+    const group = codeFixesBySpec.get(fix.specPath);
+    if (group) {
+      group.push(fix);
+    } else {
+      codeFixesBySpec.set(fix.specPath, [fix]);
+    }
+  }
+
+  const codeSections = Array.from(codeFixesBySpec.entries()).map(([specPath, entries]) => {
+    const [primary] = entries;
+    const testNames = entries.map((e) => e.testName).filter((n): n is string => !!n);
+
     return [
-      `### \`${toRelative(fix.specPath)}\``,
+      `### \`${toRelative(specPath)}\``,
       '',
-      fix.explanation || '_No explanation provided by the LLM._',
-      fix.errorLog ? `\n**Original failure:**\n\`\`\`\n${fix.errorLog}\n\`\`\`` : '',
+      testNames.length > 0 ? `**Repaired test(s):** ${testNames.map((n) => `\`${n}\``).join(', ')}` : '',
+      '',
+      primary.explanation || '_No explanation provided by the LLM._',
+      entries.length > 1
+        ? '\n**Original failures:**\n' +
+          entries
+            .map((e) => `- \`${e.testName || 'unknown test'}\`:\n  \`\`\`\n  ${(e.errorLog || 'No error message captured').replace(/\n/g, '\n  ')}\n  \`\`\``)
+            .join('\n')
+        : primary.errorLog
+        ? `\n**Original failure:**\n\`\`\`\n${primary.errorLog}\n\`\`\``
+        : '',
     ]
       .filter(Boolean)
       .join('\n');
@@ -236,10 +285,22 @@ export function stageHealingFix(fix: HealedFixEntry): void {
     return;
   }
 
+  // A single spec file can now produce multiple HealedFixEntry records —
+  // one per originally-failing test (see fixTrace.ts's
+  // `additionalFailingTests` aggregation) — but there is only ONE file
+  // write/commit to make per file. Skip re-staging/committing a spec path
+  // that was already committed earlier in this run, so a file with N
+  // healed tests never attempts N git commits for what is really a single
+  // change.
+  if (stagedSpecPaths.has(relativeSpecPath)) {
+    return;
+  }
+
   git(['add', relativeSpecPath], repoRoot);
 
   const commitMessage = `fix(auto-heal): repair ${relativeSpecPath}\n\n${fix.explanation}`;
   git(['commit', '-m', commitMessage], repoRoot);
+  stagedSpecPaths.add(relativeSpecPath);
 }
 
 /**

@@ -3,6 +3,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.notifyShorkyCloudBatch = notifyShorkyCloudBatch;
+exports.collectFailedSpecsFromReport = collectFailedSpecsFromReport;
 exports.runReportFix = runReportFix;
 exports.runOfflineFix = runOfflineFix;
 const fs_1 = __importDefault(require("fs"));
@@ -122,7 +124,24 @@ async function notifyShorkyCloudBatch(fixes, runId) {
     // this log immediately reveals whether the bug is upstream (multiple
     // distinct runIds reaching this function) or downstream (this function
     // failing to propagate the shared runId into individual dispatches).
-    console.log(`📋 [Diagnostic] notifyShorkyCloudBatch: dispatching ${notifiable.length}/${fixes.length} fix(es) under shared runId="${runId}":`, JSON.stringify(notifiable.map((fix) => ({ specPath: fix.specPath, hasFixedCode: !!fix.fixedCode, isVisualRegression: !!fix.isVisualRegression })), null, 2));
+    console.log(`📋 [Diagnostic] notifyShorkyCloudBatch: dispatching ${notifiable.length}/${fixes.length} fix(es) under shared runId="${runId}":`, JSON.stringify(notifiable.map((fix) => ({ specPath: fix.specPath, testName: fix.testName, hasFixedCode: !!fix.fixedCode, isVisualRegression: !!fix.isVisualRegression })), null, 2));
+    // [DIAGNOSTIC] Explicitly call out any fix entries EXCLUDED from
+    // `notifiable`, and why, so a future "N/(N+1) fix(es)" log line is never
+    // a silent mystery again — every drop is now individually accounted for.
+    const skipped = fixes.filter((fix) => !notifiable.includes(fix));
+    if (skipped.length > 0) {
+        console.log(`📋 [Diagnostic] notifyShorkyCloudBatch: ${skipped.length} fix(es) excluded from this dispatch:`, JSON.stringify(skipped.map((fix) => ({
+            specPath: fix.specPath,
+            testName: fix.testName,
+            reason: fix.isVisualRegression
+                ? 'isVisualRegression=true (already represented in the PR body, no webhook needed)'
+                : !fix.fixedCode
+                    ? 'missing fixedCode'
+                    : !fix.specPath
+                        ? 'missing specPath'
+                        : 'unknown',
+        })), null, 2));
+    }
     if (notifiable.length === 0) {
         console.log('ℹ️ No code-fix entries with fixedCode to report to shorky-cloud for this batch.');
         return;
@@ -159,10 +178,21 @@ function extractVisualDiffArtifacts(attachments) {
     }
     return artifacts;
 }
+/**
+ * Extracted for testability: parses a Playwright JSON report and returns the
+ * list of distinct failing tests. Exported so unit tests can exercise the
+ * composite-key dedup logic directly without going through the full
+ * `runReportFix()` CLI flow.
+ */
 function collectFailedSpecsFromReport(report) {
-    // Keyed by resolved specPath so that (a) multiple retries of the same test
-    // never produce duplicate entries, and (b) multiple failing tests inside
-    // the same spec file only trigger a single offline-fix pass for that file.
+    // Keyed by a COMPOSITE `${resolvedSpecPath}::${testTitle}` key so that
+    // (a) multiple retries of the exact same test never produce duplicate
+    // entries, but (b) multiple DISTINCT failing tests inside the same spec
+    // file (e.g. two failing `test(...)` blocks in dynamic-form-elements.spec.ts)
+    // are each preserved as their own entry rather than the second one being
+    // silently dropped. Keying by specPath alone here was the root cause of
+    // failing tests going missing from both the healing pass and the
+    // telemetry payload whenever a single file had more than one failure.
     const failuresBySpec = new Map();
     function walk(suite) {
         for (const spec of suite.specs || []) {
@@ -197,10 +227,13 @@ function collectFailedSpecsFromReport(report) {
                 // so the in-place healing overwrite always targets the same file
                 // Playwright actually ran and failed.
                 const resolvedSpecPath = (0, traceParser_1.resolveSpecSourcePath)(spec.file) || spec.file || 'unknown-spec';
-                // Deduplicate by specPath: keep the first failure recorded for a
-                // given spec file so we never re-process (and re-fix) the same file
-                // multiple times in a single report.
-                if (failuresBySpec.has(resolvedSpecPath)) {
+                const testTitle = spec.title || undefined;
+                // Deduplicate by a COMPOSITE `specPath::testTitle` key: keep the
+                // first failure recorded for a given (file, test) pair so retries of
+                // the exact same test never produce duplicate entries, while still
+                // preserving every DISTINCT failing test within the same spec file.
+                const dedupeKey = `${resolvedSpecPath}::${testTitle || ''}`;
+                if (failuresBySpec.has(dedupeKey)) {
                     continue;
                 }
                 const errorLog = finalResult.error?.message || finalResult.errors?.[0]?.message;
@@ -222,8 +255,9 @@ function collectFailedSpecsFromReport(report) {
                         }
                     }
                 }
-                failuresBySpec.set(resolvedSpecPath, {
+                failuresBySpec.set(dedupeKey, {
                     specPath: resolvedSpecPath,
+                    testTitle,
                     traceZipPath: traceAttachment?.path,
                     errorLog,
                     isVisualRegression: isVisual,
@@ -318,24 +352,48 @@ async function runReportFix({ reportPath }) {
         return;
     }
     console.log(`🎯 Found ${failures.length} failed test(s) in report.`);
+    // Group failures by resolved specPath: a single spec file may have
+    // multiple distinct failing tests (see `collectFailedSpecsFromReport`'s
+    // composite-key dedup), but there is only one file on disk to repair. All
+    // failures sharing a specPath are processed together as a single group —
+    // one `runOfflineFix()` call per file (using the FIRST failure's trace as
+    // the "primary" one parsed for DOM/selector context, with every other
+    // failing test's title/error passed along via `additionalFailingTests` so
+    // the LLM prompt explicitly covers all of them) — while still producing
+    // one distinct `HealedFixEntry`/telemetry record per originally-failing
+    // test.
+    const failuresBySpecPath = new Map();
+    for (const failure of failures) {
+        const group = failuresBySpecPath.get(failure.specPath);
+        if (group) {
+            group.push(failure);
+        }
+        else {
+            failuresBySpecPath.set(failure.specPath, [failure]);
+        }
+    }
+    console.log(`🗂️ [Diagnostic] Grouped ${failures.length} failing test(s) into ${failuresBySpecPath.size} spec file(s) to repair: ` +
+        JSON.stringify(Array.from(failuresBySpecPath.entries()).map(([specPath, group]) => ({
+            specPath,
+            testCount: group.length,
+            testTitles: group.map((f) => f.testTitle || '(untitled)'),
+        }))));
     // Every fix generated during this run is staged (committed) onto the
     // same shared healing branch (batchMode: true below) rather than each
     // opening its own branch/PR. Once all failures have been processed, a
     // single consolidated pull request is pushed containing every fix.
     const healedFixes = [];
-    for (const [index, failure] of failures.entries()) {
-        console.log(`\n🎯 Target Spec: ${failure.specPath}`);
-        console.log(`📦 Trace Zip: ${failure.traceZipPath || 'N/A'}`);
-        if (failure.errorLog) {
-            console.log(`💥 Error: ${failure.errorLog}`);
-        }
-        // [DIAGNOSTIC] Announce, per fix, that it is being processed on the
-        // consolidated (batch) path with the shared suiteRunId — this makes it
-        // trivial to spot in the logs if any given spec were ever (incorrectly)
-        // diverted onto an individual/fallback path with its own runId.
-        console.log(`🔗 [Diagnostic] Fix ${index + 1}/${failures.length} ("${failure.specPath}") entering the CONSOLIDATED batch path — batchMode=true, runId="${suiteRunId}" (no individual PR or unique runId will be generated for this spec).`);
-        if (failure.isVisualRegression) {
-            console.log(`🖼️ Detected a visual regression failure for ${failure.specPath}. Bypassing LLM code repair (Visual Diff Handoff).`);
+    const specGroups = Array.from(failuresBySpecPath.entries());
+    for (const [groupIndex, [groupSpecPath, group]] of specGroups.entries()) {
+        console.log(`\n🔗 [Diagnostic] Spec group ${groupIndex + 1}/${specGroups.length} ("${groupSpecPath}", ${group.length} failing test(s)) entering the CONSOLIDATED batch path — batchMode=true, runId="${suiteRunId}" (no individual PR or unique runId will be generated for this spec).`);
+        // Visual regressions are never LLM-repaired, so each one in this group
+        // is handled independently and produces its own HealedFixEntry
+        // immediately, regardless of how many other (code-fixable) failures
+        // share the same spec file.
+        const visualFailures = group.filter((f) => f.isVisualRegression);
+        const codeFailures = group.filter((f) => !f.isVisualRegression);
+        for (const failure of visualFailures) {
+            console.log(`🖼️ Detected a visual regression failure for ${failure.specPath} ("${failure.testTitle || 'unknown test'}"). Bypassing LLM code repair (Visual Diff Handoff).`);
             if (failure.visualDiff?.expectedPath)
                 console.log(`   - Expected: ${failure.visualDiff.expectedPath}`);
             if (failure.visualDiff?.actualPath)
@@ -348,6 +406,7 @@ async function runReportFix({ reportPath }) {
                 errorLog: failure.errorLog,
                 isVisualRegression: true,
                 visualDiff: failure.visualDiff,
+                testName: failure.testTitle || path_1.default.basename(failure.specPath),
             };
             try {
                 (0, githubPr_1.stageHealingFix)(visualHandoffFix);
@@ -357,36 +416,53 @@ async function runReportFix({ reportPath }) {
                 console.warn(`⚠️ Failed to stage the visual diff handoff entry for ${failure.specPath}:`, err.message || err);
             }
             healedFixes.push(visualHandoffFix);
+        }
+        if (codeFailures.length === 0) {
             continue;
         }
-        const resolvedTraceZipPath = failure.traceZipPath ? path_1.default.resolve(failure.traceZipPath) : undefined;
-        const resolvedSpecFsPath = path_1.default.resolve(failure.specPath);
-        if (resolvedTraceZipPath && fs_1.default.existsSync(resolvedTraceZipPath) && fs_1.default.existsSync(resolvedSpecFsPath)) {
+        // Every code-fixable failure in this group targets the SAME file on
+        // disk — there is exactly one repair pass to make. The first failure
+        // with a usable trace.zip becomes the "primary" one (its trace is
+        // parsed for DOM/selector context); every OTHER code-fixable failure in
+        // the group is passed along as `additionalFailingTests` so the LLM
+        // prompt explicitly covers every failing test, not just the primary
+        // one — see `runOfflineFix`'s `additionalFailingTests` option.
+        const primaryFailure = codeFailures.find((f) => f.traceZipPath && fs_1.default.existsSync(path_1.default.resolve(f.traceZipPath)));
+        console.log(`\n🎯 Target Spec: ${groupSpecPath} (${codeFailures.length} failing test(s) in this file)`);
+        for (const f of codeFailures) {
+            console.log(`💥 [${f.testTitle || 'unknown test'}] ${f.errorLog || 'No error message captured'}`);
+        }
+        if (!primaryFailure) {
+            console.warn(`⚠️ Skipping offline fix for ${groupSpecPath} — none of its ${codeFailures.length} failing test(s) have a usable trace.zip on disk. [Diagnostic] No individual fallback path is taken here; this spec is simply omitted from the batch.`);
+            continue;
+        }
+        const resolvedTraceZipPath = path_1.default.resolve(primaryFailure.traceZipPath);
+        const resolvedSpecFsPath = path_1.default.resolve(groupSpecPath);
+        if (fs_1.default.existsSync(resolvedSpecFsPath)) {
+            const otherCodeFailures = codeFailures.filter((f) => f !== primaryFailure);
             try {
-                const healedFix = await runOfflineFix({
+                const healedFixesForSpec = await runOfflineFix({
                     tracePath: resolvedTraceZipPath,
-                    specPath: failure.specPath,
+                    specPath: groupSpecPath,
                     batchMode: true,
                     runId: suiteRunId,
+                    additionalFailingTests: otherCodeFailures.map((f) => ({
+                        testTitle: f.testTitle,
+                        errorLog: f.errorLog,
+                        traceZipPath: f.traceZipPath,
+                    })),
                 });
-                if (healedFix) {
-                    healedFixes.push(healedFix);
-                    console.log(`✅ [Diagnostic] Fix for "${failure.specPath}" collected into the batch (total staged so far: ${healedFixes.length}). Still no PR/webhook fired — deferred until the batch loop completes.`);
+                if (healedFixesForSpec) {
+                    healedFixes.push(...healedFixesForSpec);
+                    console.log(`✅ [Diagnostic] ${healedFixesForSpec.length} fix record(s) for "${groupSpecPath}" collected into the batch (total staged so far: ${healedFixes.length}). Still no PR/webhook fired — deferred until the batch loop completes.`);
                 }
             }
             catch (err) {
-                console.error(`❌ Error running fixTrace for ${failure.specPath}:`, err instanceof Error ? err.message : err);
+                console.error(`❌ Error running fixTrace for ${groupSpecPath}:`, err instanceof Error ? err.message : err);
             }
         }
         else {
-            const missing = [];
-            if (!resolvedTraceZipPath || !fs_1.default.existsSync(resolvedTraceZipPath)) {
-                missing.push(`trace.zip (${resolvedTraceZipPath || 'N/A'})`);
-            }
-            if (!fs_1.default.existsSync(resolvedSpecFsPath)) {
-                missing.push(`spec file (${resolvedSpecFsPath})`);
-            }
-            console.warn(`⚠️ Skipping offline fix for ${failure.specPath} — missing on disk: ${missing.join(', ')}. [Diagnostic] No individual fallback path is taken here; this spec is simply omitted from the batch.`);
+            console.warn(`⚠️ Skipping offline fix for ${groupSpecPath} — missing on disk: spec file (${resolvedSpecFsPath}). [Diagnostic] No individual fallback path is taken here; this spec is simply omitted from the batch.`);
         }
     }
     if (healedFixes.length === 0) {
@@ -398,7 +474,7 @@ async function runReportFix({ reportPath }) {
     // and to notifyShorkyCloudBatch. This is the definitive proof point that
     // all N fixes collected during the loop above are being aggregated into a
     // single call rather than leaking into per-fix PR/webhook calls.
-    console.log(`📦 [Diagnostic] Aggregated batch payload (${healedFixes.length} fix(es), suiteRunId="${suiteRunId}") about to be sent as ONE consolidated branch push / GitHub API PR call:`, JSON.stringify(healedFixes.map((fix) => ({ specPath: fix.specPath, isVisualRegression: !!fix.isVisualRegression, hasFixedCode: !!fix.fixedCode })), null, 2));
+    console.log(`📦 [Diagnostic] Aggregated batch payload (${healedFixes.length} fix(es), suiteRunId="${suiteRunId}") about to be sent as ONE consolidated branch push / GitHub API PR call:`, JSON.stringify(healedFixes.map((fix) => ({ specPath: fix.specPath, testName: fix.testName, isVisualRegression: !!fix.isVisualRegression, hasFixedCode: !!fix.fixedCode })), null, 2));
     console.log(`\n📦 Pushing consolidated healing branch with ${healedFixes.length} fix(es)...`);
     const prUrl = await (0, githubPr_1.pushConsolidatedHealingBranch)(healedFixes);
     if (!prUrl) {
@@ -415,7 +491,7 @@ async function runReportFix({ reportPath }) {
     // than registering a separate run per spec.
     await notifyShorkyCloudBatch(healedFixes, suiteRunId);
 }
-async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, skipPreflightCheck = false, }) {
+async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, skipPreflightCheck = false, additionalFailingTests, }) {
     // Pre-flight budget guard: only run here for the standalone (non-batch)
     // --trace/--spec invocation. Batch runs (runReportFix) already perform
     // this check exactly once before the loop that calls runOfflineFix() for
@@ -502,11 +578,36 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
                 console.warn(`⚠️ No pull request was opened for the visual regression review entry for ${specPath}.`);
             }
         }
-        return visualHandoffFix;
+        return [visualHandoffFix];
     }
     console.log(`\n🤖 Sending failure context & ${specPath} to LLM Fixer...`);
     const originalSpecCode = fs_1.default.readFileSync(absoluteSpecPath, 'utf-8');
-    const fixResult = await (0, codeFixer_1.generateSpecFix)(originalSpecCode, failureContext);
+    // The trace's own testTitle (if any) identifies the "primary" failing
+    // test whose trace we actually parsed for DOM/selector context. When
+    // other tests in the SAME spec file also failed (see
+    // `additionalFailingTests`, populated by runReportFix()'s per-specPath
+    // grouping step), combine every failing test's title + error message
+    // into a single prompt so the LLM is explicitly told it must repair ALL
+    // of them — not just the one whose trace happens to be available. This
+    // does NOT change how many HealedFixEntry records are ultimately
+    // produced/reported (still one per originally-failing test); it only
+    // changes what's sent to generateSpecFix() so the single resulting fix
+    // actually addresses every failure in the file.
+    const primaryTestTitle = failureContext.testTitle || path_1.default.basename(specPath);
+    const promptFailureContext = additionalFailingTests && additionalFailingTests.length > 0
+        ? {
+            ...failureContext,
+            errorMessage: [
+                `This spec file has ${additionalFailingTests.length + 1} FAILING TESTS that must ALL be fixed by this single repair:`,
+                `1. "${primaryTestTitle}": ${failureContext.errorMessage || 'No error message captured'}`,
+                ...additionalFailingTests.map((extra, i) => `${i + 2}. "${extra.testTitle || 'Unknown test'}": ${extra.errorLog || 'No error message captured'}`),
+            ].join('\n'),
+        }
+        : failureContext;
+    if (additionalFailingTests && additionalFailingTests.length > 0) {
+        console.log(`🧩 [Diagnostic] Combining ${additionalFailingTests.length + 1} failing tests' error contexts for "${specPath}" into a single generateSpecFix() prompt.`);
+    }
+    const fixResult = await (0, codeFixer_1.generateSpecFix)(originalSpecCode, promptFailureContext);
     console.log(`\n✅ Fix Generated!`);
     console.log(`📝 Explanation: ${fixResult.explanation}`);
     console.log(`\n--- Code Diff Preview ---`);
@@ -525,7 +626,7 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
     // `/api/v1/telemetry`); fall back to the spec's basename only when the
     // trace didn't carry a title (e.g. an unexpected/older trace layout), so
     // the webhook payload's `testName` is never left empty.
-    const resolvedTestName = failureContext.testTitle || path_1.default.basename(specPath);
+    const resolvedTestName = primaryTestTitle;
     const healedFix = {
         specPath,
         explanation: fixResult.explanation,
@@ -539,10 +640,28 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
         // to shorky-cloud's /api/webhook for the tokensUsedThisMonth budget guard.
         tokensUsed: fixResult.tokensUsed,
     };
+    // One additional HealedFixEntry per OTHER failing test that shared this
+    // spec file (see `additionalFailingTests`). These reuse the SAME
+    // generated fixedCode/explanation (there is only one file, patched once)
+    // but carry their own testName/errorLog, so telemetry accurately reports
+    // one repair record per originally-failing test rather than collapsing
+    // them into a single entry (or dropping them entirely).
+    const additionalHealedFixes = (additionalFailingTests || []).map((extra) => ({
+        specPath,
+        explanation: fixResult.explanation,
+        errorLog: extra.errorLog,
+        fixedCode: overwriteResult.cleanedCode,
+        traceZipPath: extra.traceZipPath || absoluteTracePath,
+        testName: extra.testTitle || path_1.default.basename(specPath),
+        tokensUsed: fixResult.tokensUsed,
+    }));
+    const allHealedFixes = [healedFix, ...additionalHealedFixes];
     if (batchMode) {
         // Batch report mode: only stage the fix onto the shared consolidated
-        // healing branch. Individual PR creation and per-spec webhook dispatch
-        // are intentionally skipped here — `runReportFix` pushes exactly one
+        // healing branch — and only ONCE per spec file, regardless of how many
+        // failing tests it contains, since there is only one file/commit to
+        // stage. Individual PR creation and per-spec webhook dispatch are
+        // intentionally skipped here — `runReportFix` pushes exactly one
         // consolidated branch/PR and fires exactly one consolidated webhook
         // once every failure in the report has been processed.
         console.log(`🔗 [Diagnostic] "${specPath}" entering the CONSOLIDATED path — staging only (batchMode=true, runId="${effectiveRunId}"). openHealingPullRequest() will NOT be called for this spec.`);
@@ -567,13 +686,16 @@ async function runOfflineFix({ tracePath, specPath, batchMode = false, runId, sk
         if (!prUrl) {
             console.warn(`⚠️ No pull request was opened for ${specPath}. Ensure GITHUB_TOKEN and GITHUB_REPOSITORY are set, and that the workflow grants "contents: write" and "pull-requests: write" permissions.`);
         }
-        // Dispatch the per-spec webhook only for the standalone (non-batch)
-        // single-fix flow. Batch runs are notified once, in aggregate, from
-        // `runReportFix` after the consolidated PR is opened.
-        await notifyShorkyCloud(specPath, { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation }, absoluteTracePath, failureContext.errorMessage, effectiveRunId, resolvedTestName, fixResult.tokensUsed);
+        // Dispatch a per-spec webhook for EVERY originally-failing test in this
+        // file (standalone (non-batch) single-fix flow only — batch runs are
+        // notified once, in aggregate, from `runReportFix` after the
+        // consolidated PR is opened).
+        for (const fix of allHealedFixes) {
+            await notifyShorkyCloud(specPath, { fixedCode: overwriteResult.cleanedCode, explanation: fixResult.explanation }, fix.traceZipPath, fix.errorLog, effectiveRunId, fix.testName, fixResult.tokensUsed);
+        }
         (0, shorkyCloud_1.logDashboardCallToAction)();
     }
-    return healedFix;
+    return allHealedFixes;
 }
 if (process.argv[1] && process.argv[1].replace(/\\/g, '/').endsWith('src/cli/fixTrace.ts')) {
     const args = process.argv.slice(2);
