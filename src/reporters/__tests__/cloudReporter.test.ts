@@ -189,6 +189,66 @@ test('onTestEnd + onEnd: a single-attempt (no retries) passing test still emits 
   assert.equal(payload.passedCount, 1);
 });
 
+test('onTestEnd + onEnd: strips ANSI color escape codes from the error message', async () => {
+  const reporter = new ShorkyCloudReporter();
+
+  const onlyAttempt = makeResult({
+    status: 'failed',
+    error: { message: '\x1b[31mTest timeout of 30000ms exceeded.\x1b[39m' },
+  });
+  const test1 = makeTestCase('test-1', 'ansi test', [onlyAttempt], 'unexpected');
+
+  reporter.onTestEnd(test1, onlyAttempt);
+
+  const payload = await runOnEndAndCapturePayload(reporter);
+  const message = payload.tests[0].traceLogs[0]?.message ?? '';
+
+  assert.equal(message, 'Test timeout of 30000ms exceeded.');
+  assert.doesNotMatch(message, /\x1b\[/, 'no raw ANSI escape sequence should remain in the stored message');
+  assert.doesNotMatch(message, /\[31m|\[39m/, 'no visible "[31m"-style leftover should remain either');
+});
+
+test('onTestEnd + onEnd: does NOT add "[Attempt N/M]" prefixes when every retry fails with the identical (ANSI-stripped) error', async () => {
+  const reporter = new ShorkyCloudReporter();
+
+  // Same underlying message on every attempt, but wrapped in DIFFERENT
+  // ANSI color codes (as Playwright often does) — these must be treated
+  // as identical once stripped, so no "[Attempt N/M]" numbering is added.
+  const attempt1 = makeResult({ status: 'timedOut', error: { message: '\x1b[31mTest timeout of 30000ms exceeded.\x1b[39m' } });
+  const attempt2 = makeResult({ status: 'timedOut', error: { message: 'Test timeout of 30000ms exceeded.' } });
+  const attempt3 = makeResult({ status: 'timedOut', error: { message: '\x1b[31mTest timeout of 30000ms exceeded.\x1b[0m' } });
+  const results = [attempt1, attempt2, attempt3];
+  const test1 = makeTestCase('test-1', 'repeatedly-identical failure', results, 'unexpected');
+
+  reporter.onTestEnd(test1, attempt1);
+  reporter.onTestEnd(test1, attempt2);
+  reporter.onTestEnd(test1, attempt3);
+
+  const payload = await runOnEndAndCapturePayload(reporter);
+  const message = payload.tests[0].traceLogs[0]?.message ?? '';
+
+  assert.equal(message, 'Test timeout of 30000ms exceeded.');
+  assert.doesNotMatch(message, /\[Attempt/, 'identical errors across retries must not be prefixed with attempt numbers');
+});
+
+test('onTestEnd + onEnd: DOES add "[Attempt N/M]" prefixes when retries fail with genuinely different errors', async () => {
+  const reporter = new ShorkyCloudReporter();
+
+  const attempt1 = makeResult({ status: 'timedOut', error: { message: 'Element not found: #submit' } });
+  const attempt2 = makeResult({ status: 'timedOut', error: { message: 'Element not found: #confirm' } });
+  const results = [attempt1, attempt2];
+  const test1 = makeTestCase('test-1', 'genuinely different failures', results, 'unexpected');
+
+  reporter.onTestEnd(test1, attempt1);
+  reporter.onTestEnd(test1, attempt2);
+
+  const payload = await runOnEndAndCapturePayload(reporter);
+  const message = payload.tests[0].traceLogs[0]?.message ?? '';
+
+  assert.match(message, /\[Attempt 1\/2\] Element not found: #submit/);
+  assert.match(message, /\[Attempt 2\/2\] Element not found: #confirm/);
+});
+
 test('onTestEnd: does nothing when no API key is configured', () => {
   delete process.env.SHORKY_CLOUD_API_KEY;
   const reporter = new ShorkyCloudReporter();

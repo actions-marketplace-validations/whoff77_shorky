@@ -5,6 +5,27 @@ const autoHealFixture_1 = require("../fixtures/autoHealFixture");
 const gitContext_1 = require("../utils/gitContext");
 const preflight_1 = require("../cli/preflight");
 const executionId_1 = require("../utils/executionId");
+// Matches ANSI/VT100 escape sequences (e.g. `\u001b[31m`, `\u001b[39m`) that
+// Playwright embeds in `error.message`/`error.stack` for terminal color
+// highlighting (red for failures, etc.). These render as illegible raw
+// codes like "[31m" once persisted as plain text and displayed on the
+// shorky-cloud dashboard, so they're stripped before the message is ever
+// stored/combined.
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE_CODE_RE = /\x1b\[[0-9;]*m/g;
+/** Strips ANSI/VT100 color escape codes from a Playwright error string. */
+function stripAnsiCodes(value) {
+    return value.replace(ANSI_ESCAPE_CODE_RE, '');
+}
+/**
+ * Resolves the single displayable error message for a given attempt,
+ * stripped of ANSI color codes, falling back to the stack trace or a
+ * generic placeholder when no message is available.
+ */
+function resolveCleanErrorMessage(result) {
+    const raw = result.error?.message || result.error?.stack || 'Unknown error';
+    return stripAnsiCodes(raw).trim();
+}
 /**
  * Extracts the LLM token count `autoHealFixture.ts` attached to this test
  * result (see `SHORKY_TOKENS_ATTACHMENT_NAME`), if any. Attachments cross
@@ -77,13 +98,22 @@ class ShorkyCloudReporter {
         // skipped/interrupted results.
         // Combine the error message from EVERY attempt failed SO FAR (not just
         // this one) so the final overwritten entry reflects the full retry
-        // history once the last attempt's onTestEnd() call overwrites it.
+        // history once the last attempt's onTestEnd() call overwrites it. Each
+        // attempt's message is ANSI-stripped first (see resolveCleanErrorMessage)
+        // so the stored/dashboard-rendered text never contains raw terminal
+        // color codes like "[31m".
         const failedAttempts = test.results.filter((r) => r.status === 'failed' || r.status === 'timedOut');
-        const errorMessage = failedAttempts.length > 1
-            ? failedAttempts
-                .map((r, i) => `[Attempt ${i + 1}/${failedAttempts.length}] ${r.error?.message || r.error?.stack || 'Unknown error'}`)
-                .join('\n')
-            : result.error?.message || result.error?.stack;
+        const cleanedFailedMessages = failedAttempts.map(resolveCleanErrorMessage);
+        // A retried test very often fails with the EXACT same error on every
+        // attempt (e.g. the same broken selector timing out identically each
+        // time) — in that case there's nothing useful about numbering them, so
+        // only prefix with "[Attempt N/M]" when the attempts' messages
+        // actually DIFFER from one another; otherwise just report the single
+        // shared message once.
+        const uniqueFailedMessages = Array.from(new Set(cleanedFailedMessages));
+        const errorMessage = uniqueFailedMessages.length > 1
+            ? cleanedFailedMessages.map((msg, i) => `[Attempt ${i + 1}/${cleanedFailedMessages.length}] ${msg}`).join('\n')
+            : uniqueFailedMessages[0] ?? resolveCleanErrorMessage(result);
         // Tokens are attached per-attempt (see autoHealFixture.ts); sum across
         // every attempt observed so far so retried self-healing spend is never
         // undercounted once only the final overwritten entry is read back.
