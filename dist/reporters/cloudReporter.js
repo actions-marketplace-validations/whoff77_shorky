@@ -4,6 +4,7 @@ const shorkyCloud_1 = require("../config/shorkyCloud");
 const autoHealFixture_1 = require("../fixtures/autoHealFixture");
 const gitContext_1 = require("../utils/gitContext");
 const preflight_1 = require("../cli/preflight");
+const executionId_1 = require("../utils/executionId");
 /**
  * Extracts the LLM token count `autoHealFixture.ts` attached to this test
  * result (see `SHORKY_TOKENS_ATTACHMENT_NAME`), if any. Attachments cross
@@ -43,17 +44,59 @@ class ShorkyCloudReporter {
     onTestEnd(test, result) {
         if (!this.apiKey)
             return;
+        // Playwright calls onTestEnd() once per ATTEMPT — the initial run plus
+        // every retry (see @playwright/test's runner, which invokes
+        // `reporter.onTestEnd?.(test, result)` synchronously after each
+        // attempt finishes) — not once per test. With retries enabled (e.g.
+        // `retries: 2` on CI), a single test that times out 3 times previously
+        // caused THREE separate pushes here, tripling both `runData.failed`
+        // and the number of `tests[]` entries sent to shorky-cloud for what is
+        // really one test.
+        //
+        // `test.results` accumulates every attempt's TestResult in order, and
+        // by the time this callback fires for a given attempt, that attempt's
+        // result is always the LAST entry in `test.results` (Playwright
+        // appends to it before invoking the reporter). So comparing the
+        // current `result` against `test.results[test.results.length - 1]`
+        // reliably detects "this is the final attempt for this test" — the
+        // one whose outcome should actually be reported — and skips emitting
+        // anything for earlier (intermediate, retried) attempts.
+        const isFinalAttempt = test.results[test.results.length - 1] === result;
+        if (!isFinalAttempt) {
+            return;
+        }
         let testStatus = 'passed';
-        if (result.status === 'passed') {
+        // `test.outcome()` reflects Playwright's own final verdict across all
+        // retries ('flaky' when a later attempt passed after earlier
+        // failures, 'unexpected' when every attempt ultimately failed) —
+        // preferred here over inspecting `result.status` in isolation so a
+        // flaky-but-ultimately-passing test is correctly reported as passed
+        // rather than failed.
+        const outcome = test.outcome();
+        if (outcome === 'expected' || outcome === 'flaky') {
             this.runData.passed++;
             testStatus = 'passed';
         }
-        else if (result.status === 'failed' || result.status === 'timedOut') {
+        else if (outcome === 'unexpected') {
             this.runData.failed++;
             testStatus = 'failed';
         }
-        const errorMessage = result.error?.message || result.error?.stack;
-        const tokensUsed = extractTokensUsed(result);
+        // outcome() === 'skipped' intentionally increments neither counter and
+        // leaves testStatus at its 'passed' default, matching this reporter's
+        // previous (pre-dedup) behavior for skipped/interrupted results.
+        // Combine the error message from EVERY failed attempt (not just the
+        // final one) so the telemetry record still reflects the full retry
+        // history, even though only one record is now emitted per test.
+        const failedAttempts = test.results.filter((r) => r.status === 'failed' || r.status === 'timedOut');
+        const errorMessage = failedAttempts.length > 1
+            ? failedAttempts
+                .map((r, i) => `[Attempt ${i + 1}/${failedAttempts.length}] ${r.error?.message || r.error?.stack || 'Unknown error'}`)
+                .join('\n')
+            : result.error?.message || result.error?.stack;
+        // Tokens are attached per-attempt (see autoHealFixture.ts); sum across
+        // every attempt so retried self-healing spend is never undercounted
+        // now that only one telemetry record is emitted per test.
+        const tokensUsed = test.results.reduce((sum, r) => sum + extractTokensUsed(r), 0);
         this.testItems.push({
             title: test.title,
             status: testStatus,
@@ -101,11 +144,22 @@ class ShorkyCloudReporter {
             // sends, so the dashboard shows a consistent repo identity for both
             // the run-level telemetry (this reporter) and the per-fix webhook.
             const [repoOwner, repoName] = (0, gitContext_1.resolveRepositoryName)().split('/');
+            // Resolve the SAME shared execution ID `fixTrace.ts`'s
+            // notifyShorkyCloud()/notifyShorkyCloudBatch() resolve for this exact
+            // CI run (see executionId.ts's getExecutionId()) — prioritizing the
+            // numeric GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT (deterministically hashed
+            // into UUID shape), so this reporter (running in the Playwright test
+            // process) and the separate Shorky CLI process (running afterwards,
+            // as its own GitHub Actions step) always tag their respective
+            // telemetry/webhook dispatches with the identical runId instead of
+            // each independently minting its own random UUID.
+            const runId = (0, executionId_1.getExecutionId)();
             // Construct the flattened payload matching shorky-cloud's Zod schema
             const telemetryPayload = {
                 projectName: process.env.SHORKY_PROJECT_NAME || 'shorky',
                 repoOwner,
                 repoName,
+                runId,
                 status: failedCount > 0 ? 'failed' : 'passed',
                 passedCount,
                 failedCount,
