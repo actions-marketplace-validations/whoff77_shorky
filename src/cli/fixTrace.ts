@@ -1,6 +1,5 @@
 import fs from 'fs';
 import path from 'path';
-import { randomUUID } from 'crypto';
 import { parsePlaywrightTrace, resolveSpecSourcePath, isVisualRegressionFailure } from '../engine/traceParser';
 import { generateSpecFix, FixResult } from '../engine/codeFixer';
 import { getShorkyCloudApiKey, getShorkyCloudWebhookUrl, logDashboardCallToAction } from '../config/shorkyCloud';
@@ -8,6 +7,7 @@ import { runPreflightCheck } from './preflight';
 import { HealedFixEntry, openHealingPullRequest, pushConsolidatedHealingBranch, stageHealingFix } from '../utils/githubPr';
 import { overwriteSpecInPlace } from '../utils/specWriter';
 import { resolveRepositoryName } from '../utils/gitContext';
+import { getExecutionId } from '../utils/executionId';
 
 import dotenv from 'dotenv';
 dotenv.config();
@@ -411,23 +411,14 @@ export function collectFailedSpecsFromReport(report: PlaywrightJsonReport): Fail
  *      preserving the previous behavior for those cases.
  */
 function resolveSuiteRunId(reportPath: string): string {
-  if (process.env.SHORKY_RUN_ID) {
-    console.log(`🆔 [Diagnostic] Reusing shared suiteRunId="${process.env.SHORKY_RUN_ID}" from SHORKY_RUN_ID env var.`);
-    return process.env.SHORKY_RUN_ID;
-  }
-
-  const runIdFilePath = path.join(path.dirname(path.resolve(reportPath)), '.shorky-run-id');
-  if (fs.existsSync(runIdFilePath)) {
-    const fileRunId = fs.readFileSync(runIdFilePath, 'utf-8').trim();
-    if (fileRunId) {
-      console.log(`🆔 [Diagnostic] Reusing shared suiteRunId="${fileRunId}" from ${runIdFilePath} (written by global-setup.ts before workers were spawned).`);
-      return fileRunId;
-    }
-  }
-
-  const generatedRunId = randomUUID();
-  console.log(`🆔 [Diagnostic] No shared SHORKY_RUN_ID env var or ${runIdFilePath} found — minting a fresh suiteRunId="${generatedRunId}".`);
-  return generatedRunId;
+  // Delegates to the shared getExecutionId() util (see executionId.ts) so
+  // this CLI process and the separate Playwright reporter process
+  // (cloudReporter.ts) always resolve to the SAME identifier —
+  // prioritizing GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT (numeric, automatically
+  // shared by GitHub Actions across every step), then SHORKY_RUN_ID, then
+  // the `.shorky-run-id` deterministic file handoff located next to the
+  // report file (matching where global-setup.ts/cloudReporter.ts write it).
+  return getExecutionId(path.dirname(path.resolve(reportPath)));
 }
 
 export interface RunReportFixOptions {
@@ -728,7 +719,14 @@ export async function runOfflineFix({
     );
   }
 
-  const effectiveRunId = runId || randomUUID();
+  // Standalone (non-batch) invocation with no explicit runId supplied:
+  // resolve the shared execution ID the SAME way cloudReporter.ts does
+  // (GITHUB_RUN_ID/GITHUB_RUN_ATTEMPT, then SHORKY_RUN_ID, then the
+  // `.shorky-run-id` file handoff, only falling back to a freshly minted
+  // UUID as a last resort) — rather than unconditionally minting a new
+  // UUID here, which is what previously caused this CLI process and the
+  // Playwright reporter process to disagree on the run identifier.
+  const effectiveRunId = runId || getExecutionId();
 
   // [DIAGNOSTIC] Print the evaluated batchMode flag and the runId this
   // invocation will actually use. When called from runReportFix(), batchMode
