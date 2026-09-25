@@ -15,6 +15,30 @@ interface TestRunItem {
   tokensUsed: number;
 }
 
+// Matches ANSI/VT100 escape sequences (e.g. `\u001b[31m`, `\u001b[39m`) that
+// Playwright embeds in `error.message`/`error.stack` for terminal color
+// highlighting (red for failures, etc.). These render as illegible raw
+// codes like "[31m" once persisted as plain text and displayed on the
+// shorky-cloud dashboard, so they're stripped before the message is ever
+// stored/combined.
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE_CODE_RE = /\x1b\[[0-9;]*m/g;
+
+/** Strips ANSI/VT100 color escape codes from a Playwright error string. */
+function stripAnsiCodes(value: string): string {
+  return value.replace(ANSI_ESCAPE_CODE_RE, '');
+}
+
+/**
+ * Resolves the single displayable error message for a given attempt,
+ * stripped of ANSI color codes, falling back to the stack trace or a
+ * generic placeholder when no message is available.
+ */
+function resolveCleanErrorMessage(result: TestResult): string {
+  const raw = result.error?.message || result.error?.stack || 'Unknown error';
+  return stripAnsiCodes(raw).trim();
+}
+
 /**
  * Extracts the LLM token count `autoHealFixture.ts` attached to this test
  * result (see `SHORKY_TOKENS_ATTACHMENT_NAME`), if any. Attachments cross
@@ -34,19 +58,27 @@ function extractTokensUsed(result: TestResult): number {
 export default class ShorkyCloudReporter implements Reporter {
   private apiEndpoint: string;
   private apiKey: string;
-  private testItems: TestRunItem[] = [];
-  private runData: {
-    passed: number;
-    failed: number;
-  };
+  // Accumulates ONE entry per test, keyed by `test.id` (a stable,
+  // Playwright-assigned identifier — see TestCase.id — unique within the
+  // session, unlike `test.title` which can collide across describe blocks/
+  // projects). Playwright invokes `onTestEnd()` once per ATTEMPT — the
+  // initial run plus every retry (see @playwright/test's runner, which
+  // calls `reporter.onTestEnd?.(test, result)` synchronously after each
+  // attempt finishes) — and, critically, `result` is ALREADY the last
+  // element of `test.results` at the moment ANY attempt's `onTestEnd`
+  // fires (Playwright appends it in `_onTestBegin()`, before the attempt
+  // even runs). That means a "is this the final attempt?" check comparing
+  // `result` against `test.results[test.results.length - 1]` is always
+  // true and never actually filters anything out — the real fix is to
+  // never treat any individual `onTestEnd()` call as final. Instead, each
+  // call simply OVERWRITES this test's entry in the Map with the latest
+  // snapshot; by definition, whatever is in the Map when `onEnd()` finally
+  // reads it reflects each test's LAST (i.e. final/terminal) attempt.
+  private testResultsById = new Map<string, TestRunItem>();
 
   constructor() {
     this.apiEndpoint = getShorkyCloudTelemetryUrl();
     this.apiKey = getShorkyCloudApiKey();
-    this.runData = {
-      passed: 0,
-      failed: 0,
-    };
   }
 
   onBegin(config: FullConfig, suite: Suite) {
@@ -61,65 +93,58 @@ export default class ShorkyCloudReporter implements Reporter {
   onTestEnd(test: TestCase, result: TestResult) {
     if (!this.apiKey) return;
 
-    // Playwright calls onTestEnd() once per ATTEMPT — the initial run plus
-    // every retry (see @playwright/test's runner, which invokes
-    // `reporter.onTestEnd?.(test, result)` synchronously after each
-    // attempt finishes) — not once per test. With retries enabled (e.g.
-    // `retries: 2` on CI), a single test that times out 3 times previously
-    // caused THREE separate pushes here, tripling both `runData.failed`
-    // and the number of `tests[]` entries sent to shorky-cloud for what is
-    // really one test.
-    //
-    // `test.results` accumulates every attempt's TestResult in order, and
-    // by the time this callback fires for a given attempt, that attempt's
-    // result is always the LAST entry in `test.results` (Playwright
-    // appends to it before invoking the reporter). So comparing the
-    // current `result` against `test.results[test.results.length - 1]`
-    // reliably detects "this is the final attempt for this test" — the
-    // one whose outcome should actually be reported — and skips emitting
-    // anything for earlier (intermediate, retried) attempts.
-    const isFinalAttempt = test.results[test.results.length - 1] === result;
-    if (!isFinalAttempt) {
-      return;
-    }
-
     let testStatus: 'passed' | 'failed' | 'healed' = 'passed';
 
     // `test.outcome()` reflects Playwright's own final verdict across all
-    // retries ('flaky' when a later attempt passed after earlier
-    // failures, 'unexpected' when every attempt ultimately failed) —
-    // preferred here over inspecting `result.status` in isolation so a
+    // retries observed SO FAR ('flaky' once a later attempt passed after
+    // earlier failures, 'unexpected' once every attempt so far failed) —
+    // preferred over inspecting `result.status` in isolation so a
     // flaky-but-ultimately-passing test is correctly reported as passed
-    // rather than failed.
+    // rather than failed. Because this entry is overwritten on every
+    // attempt and only read back in `onEnd()` after the whole run
+    // finishes, whatever `outcome()` reports on the LAST `onTestEnd()`
+    // call for this test (i.e. after its final attempt) is authoritative.
     const outcome = test.outcome();
     if (outcome === 'expected' || outcome === 'flaky') {
-      this.runData.passed++;
       testStatus = 'passed';
     } else if (outcome === 'unexpected') {
-      this.runData.failed++;
       testStatus = 'failed';
     }
-    // outcome() === 'skipped' intentionally increments neither counter and
-    // leaves testStatus at its 'passed' default, matching this reporter's
-    // previous (pre-dedup) behavior for skipped/interrupted results.
+    // outcome() === 'skipped' intentionally leaves testStatus at its
+    // 'passed' default, matching this reporter's previous behavior for
+    // skipped/interrupted results.
 
-    // Combine the error message from EVERY failed attempt (not just the
-    // final one) so the telemetry record still reflects the full retry
-    // history, even though only one record is now emitted per test.
+    // Combine the error message from EVERY attempt failed SO FAR (not just
+    // this one) so the final overwritten entry reflects the full retry
+    // history once the last attempt's onTestEnd() call overwrites it. Each
+    // attempt's message is ANSI-stripped first (see resolveCleanErrorMessage)
+    // so the stored/dashboard-rendered text never contains raw terminal
+    // color codes like "[31m".
     const failedAttempts = test.results.filter((r) => r.status === 'failed' || r.status === 'timedOut');
+    const cleanedFailedMessages = failedAttempts.map(resolveCleanErrorMessage);
+    // A retried test very often fails with the EXACT same error on every
+    // attempt (e.g. the same broken selector timing out identically each
+    // time) — in that case there's nothing useful about numbering them, so
+    // only prefix with "[Attempt N/M]" when the attempts' messages
+    // actually DIFFER from one another; otherwise just report the single
+    // shared message once.
+    const uniqueFailedMessages = Array.from(new Set(cleanedFailedMessages));
     const errorMessage =
-      failedAttempts.length > 1
-        ? failedAttempts
-            .map((r, i) => `[Attempt ${i + 1}/${failedAttempts.length}] ${r.error?.message || r.error?.stack || 'Unknown error'}`)
-            .join('\n')
-        : result.error?.message || result.error?.stack;
+      uniqueFailedMessages.length > 1
+        ? cleanedFailedMessages.map((msg, i) => `[Attempt ${i + 1}/${cleanedFailedMessages.length}] ${msg}`).join('\n')
+        : uniqueFailedMessages[0] ?? resolveCleanErrorMessage(result);
 
     // Tokens are attached per-attempt (see autoHealFixture.ts); sum across
-    // every attempt so retried self-healing spend is never undercounted
-    // now that only one telemetry record is emitted per test.
+    // every attempt observed so far so retried self-healing spend is never
+    // undercounted once only the final overwritten entry is read back.
     const tokensUsed = test.results.reduce((sum, r) => sum + extractTokensUsed(r), 0);
 
-    this.testItems.push({
+    // OVERWRITE (never push/append) this test's entry, keyed by its stable
+    // `test.id`. A retried test's earlier attempt(s) already wrote an
+    // entry here; this attempt's call simply replaces it, so whatever
+    // remains in the Map once the whole run ends is each test's single,
+    // final-attempt snapshot — never duplicated per retry.
+    this.testResultsById.set(test.id, {
       title: test.title,
       status: testStatus,
       error: errorMessage,
@@ -156,9 +181,17 @@ export default class ShorkyCloudReporter implements Reporter {
       }
 
       console.log(`📤 [Shorky Cloud] Transmitting run artifacts to ${cloudUrl}...`);
-      
-      const passedCount = this.runData.passed;
-      const failedCount = this.runData.failed;
+
+      // Read the accumulated per-test Map back out ONLY here, once the
+      // entire run has finished — every test's entry has by now been
+      // overwritten down to its single final-attempt snapshot (see
+      // onTestEnd()'s doc comment), so `testItems` below is naturally
+      // deduplicated with exactly one record per test, and the
+      // passed/failed totals computed from it are never inflated by
+      // retries.
+      const testItems = Array.from(this.testResultsById.values());
+      const passedCount = testItems.filter((item) => item.status === 'passed').length;
+      const failedCount = testItems.filter((item) => item.status === 'failed').length;
       const durationMs = Math.round(result.duration ?? 0);
       // Sum of every test's tokensUsed (captured from OpenAI response.usage
       // during self-healing/vision calls — see tokenUsage.ts and
@@ -166,7 +199,7 @@ export default class ShorkyCloudReporter implements Reporter {
       // total below; shorky-cloud's /api/v1/telemetry uses the run-level
       // total when present, atomically incrementing that project's
       // tokensUsedThisMonth for the /api/v1/governance/preflight budget guard.
-      const totalTokensUsed = this.testItems.reduce((sum, item) => sum + item.tokensUsed, 0);
+      const totalTokensUsed = testItems.reduce((sum, item) => sum + item.tokensUsed, 0);
 
       // Standardized repo identity (GITHUB_REPOSITORY -> local .git/config
       // -> "local/unknown") — see gitContext.ts. Split into repoOwner/repoName
@@ -197,7 +230,7 @@ export default class ShorkyCloudReporter implements Reporter {
         failedCount,
         durationMs,
         tokensUsed: totalTokensUsed,
-        tests: this.testItems.map((item) => ({
+        tests: testItems.map((item) => ({
           testName: item.title,
           status: item.status,
           traceLogs: item.error 
